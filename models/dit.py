@@ -166,14 +166,30 @@ class MFDiT(nn.Module):
         num_register_tokens=4,
         num_classes=1000,
         max_cfg=4.0,
+        output_mode='uv',
+        output_activation='tanh',
+        alpha_min=0.01,
     ):
+        """
+        output_mode:
+            'uv' -> original MeanFlow/iMF dual head: returns (u, v)
+            'x'  -> AF-PSM single head: returns (x_hat, alpha); x_hat is tanh-bounded
+        output_activation: activation applied to the clean image head ('tanh',
+                           'clamp' or 'none').  Only used when output_mode='x'.
+        alpha_min: lower bound of the predicted split ratio (alpha in [alpha_min, 1]).
+        """
         super().__init__()
+        assert output_mode in ('uv', 'x'), f"unknown output_mode: {output_mode}"
+        assert output_activation in ('tanh', 'clamp', 'none')
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.num_classes = num_classes
         self.max_cfg = max_cfg
+        self.output_mode = output_mode
+        self.output_activation = output_activation
+        self.alpha_min = alpha_min
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, dim)
         self.t_embedder = TimestepEmbedder(dim)
@@ -190,8 +206,17 @@ class MFDiT(nn.Module):
         self.blocks = nn.ModuleList([
             DiTBlock(dim, num_heads, mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer_v = FinalLayer(dim, patch_size, self.out_channels)
-        self.final_layer_u = FinalLayer(dim, patch_size, self.out_channels)
+        if output_mode == 'uv':
+            self.final_layer_v = FinalLayer(dim, patch_size, self.out_channels)
+            self.final_layer_u = FinalLayer(dim, patch_size, self.out_channels)
+        else:
+            # AF-PSM: single head predicting the clean image x (tanh-bounded),
+            # plus a global-pooled head predicting the adaptive split ratio alpha.
+            self.final_layer_x = FinalLayer(dim, patch_size, self.out_channels)
+            self.alpha_norm = nn.RMSNorm(dim, elementwise_affine=False)
+            self.alpha_mlp = nn.Sequential(
+                nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, 1)
+            )
 
         self.initialize_weights()
 
@@ -227,11 +252,20 @@ class MFDiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        for final_layer in (self.final_layer_v, self.final_layer_u):
-            nn.init.constant_(final_layer.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(final_layer.adaLN_modulation[-1].bias, 0)
-            nn.init.constant_(final_layer.linear.weight, 0)
-            nn.init.constant_(final_layer.linear.bias, 0)
+        if self.output_mode == 'uv':
+            for final_layer in (self.final_layer_v, self.final_layer_u):
+                nn.init.constant_(final_layer.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(final_layer.adaLN_modulation[-1].bias, 0)
+                nn.init.constant_(final_layer.linear.weight, 0)
+                nn.init.constant_(final_layer.linear.bias, 0)
+        else:
+            nn.init.constant_(self.final_layer_x.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer_x.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(self.final_layer_x.linear.weight, 0)
+            nn.init.constant_(self.final_layer_x.linear.bias, 0)
+            # alpha head: start near the beginning of the curriculum (alpha ~ 0.97)
+            nn.init.zeros_(self.alpha_mlp[-1].weight)
+            nn.init.constant_(self.alpha_mlp[-1].bias, 3.0)
 
     def unpatchify(self, x):
         """
@@ -248,15 +282,31 @@ class MFDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, r, y=None, w=None, return_v=True, use_flash_attention=False):
+    def predict_alpha(self, h, c):
+        """
+        Adaptive split ratio from the pooled token features plus the global
+        conditioning vector c (which carries t, r, cfg scale and the label).
+        h: (N, T, D) hidden tokens after the last block
+        c: (N, D) global conditioning
+        returns alpha: (N,) in [alpha_min, 1]
+        """
+        pooled = self.alpha_norm(h.mean(dim=1))     # (N, D) global average pooling
+        logit = self.alpha_mlp(pooled + c).squeeze(-1)  # (N,)
+        # affine sigmoid: both curriculum endpoints (alpha_min and 1) are reachable
+        return self.alpha_min + (1.0 - self.alpha_min) * torch.sigmoid(logit)
+
+    def forward(self, x, t, r, y=None, w=None, return_v=True, return_alpha=True,
+                use_flash_attention=False):
         """
         Forward pass of DiT.
+
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         r: (N,) tensor of auxiliary timesteps
         y: (N,) tensor of class labels
         w: (N,) CFG scale; normalized by max_cfg before embedding. Defaults to 1.0.
-        return_v: if False, return u only; otherwise return (u, v)
+        return_v: ('uv' mode) if False, return u only; otherwise return (u, v)
+        return_alpha: ('x' mode) if False, return x_hat only; otherwise return (x_hat, alpha)
         use_flash_attention: if True, use flash SDPA when dtype/device allow
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
@@ -275,15 +325,26 @@ class MFDiT(nn.Module):
             y = self.y_embedder(y)               # (N, D)
             c = c + y                            # (N, D)
 
+        h = x
         for block in self.blocks:
-            x = block(x, c, use_flash_attention=use_flash_attention)
+            h = block(h, c, use_flash_attention=use_flash_attention)
 
-        u = self.unpatchify(self.final_layer_u(x, c))
-        if not return_v:
-            return u
+        if self.output_mode == 'uv':
+            u = self.unpatchify(self.final_layer_u(h, c))
+            if not return_v:
+                return u
+            v = self.unpatchify(self.final_layer_v(h, c))
+            return u, v
 
-        v = self.unpatchify(self.final_layer_v(x, c))
-        return u, v
+        x_hat = self.unpatchify(self.final_layer_x(h, c))   # (N, C, H, W)
+        if self.output_activation == 'tanh':
+            x_hat = torch.tanh(x_hat)
+        elif self.output_activation == 'clamp':
+            x_hat = x_hat.clamp(-1.0, 1.0)
+        if not return_alpha:
+            return x_hat
+        alpha = self.predict_alpha(h, c)                    # (N,)
+        return x_hat, alpha
 
 
 # Positional embedding from:

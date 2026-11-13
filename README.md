@@ -17,6 +17,29 @@ PyTorch implementation of [Mean Flows for One-step Generative Modeling](https://
   - JVP under `no_grad` for `dudt` only; separate grad-enabled forward pass for optimization
   - Config-based training for MNIST, CIFAR-10, and ImageNet latent
 
+**AF-PSM**
+  - `meanflow.mode: "af-psm"`: JVP-free interval-splitting training directly in pixel space
+  - Single `tanh` clean-image head + `alpha` split-ratio head (global pooling + MLP)
+  - Frequency-consistency loss; 3 shared-parameter forwards; 4-loss objective
+  - `configs/afpsm_mnist.py`, `configs/afpsm_cifar10.py`; `configs/smoke_cpu.py` + `smoke_test.py` for a CPU sanity check
+
+## AF-PSM (Adaptive Frequency-consistent Pixel Split-MeanFlow)
+
+AF-PSM replaces MeanFlow's JVP-based differential identity with [SplitMeanFlow](https://arxiv.org/abs/2507.16884)'s algebraic interval-splitting identity, re-expressed in **pixel space** (predict the image instead of the average velocity). No `torch.autograd.functional.jvp` is used anywhere, so Flash Attention can be enabled unconditionally.
+
+- trajectory convention: `z_t = (1-t) x + t e`, `v = e - x`, `t > r` while training
+- the network predicts the clean image directly: `x_hat, alpha = model(z_t, t, r)` with `x_hat = tanh(...)` and `alpha` in `[alpha_min, 1]`
+- the dynamic split point is `s = alpha * r + (1 - alpha) * t`; the intermediate sample is reconstructed in closed form from the linearity of the path: `z_s = (1 - s/t) * x_hat_s + (s/t) * z_t`
+- 3 shared-parameter forwards, 4 losses (pixel anchoring, frequency consistency, exact midpoint supervision, alpha curriculum), zero JVP
+
+```bash
+python train.py --config configs/afpsm_mnist.py                  # MNIST (GPU)
+python train.py --config configs/afpsm_cifar10.py                # CIFAR-10 (GPU)
+python train.py --config configs/smoke_cpu.py                    # ~400-step CPU sanity check
+```
+
+Switches in the `meanflow` block: `alpha_curriculum` (`linear` = 1 -> 0.01, plus `to_half`, `triangular`, `const`, `none`), `freq_loss` (`rel_hp` = ortho rfft2 with soft high-pass weighting and energy normalization, or the literal `mse`), `alpha_weight` / `freq_weight` / `mid_weight`, `alpha_stopgrad`, `detach_xs`.
+
 ## Usage
 
 `i-meanflow` (`meanflow.mode: "i-meanflow"`) is more stable and recommended for your projects. `meanflow` mode is kept for reference.
@@ -41,6 +64,9 @@ accelerate launch --num_processes 2 train.py --config configs/mnist.py
 | `configs/mnist.py` | MNIST |
 | `configs/cifar10.py` | CIFAR-10 |
 | `configs/imagenet_latent.py` | ImageNet (latent, VAE) |
+| `configs/afpsm_mnist.py` | MNIST (AF-PSM, JVP-free) |
+| `configs/afpsm_cifar10.py` | CIFAR-10 (AF-PSM, JVP-free) |
+| `configs/smoke_cpu.py` | MNIST, tiny CPU sanity check |
 
 Common config fields: `n_steps`, `batch_size`, `grad_clip`, `mixed_precision`, `meanflow.mode`, `meanflow.cfg_scale`.
 

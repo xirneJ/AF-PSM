@@ -52,6 +52,25 @@ def build_dataset(cfg):
         ])
         return ImageFolder(cfg["data_root"], transform=transform)
 
+    if cfg["dataset"] == "folder":
+        # generic image folder: keeps raw [0, 1] pixels, so `normalizer=["minmax"]`
+        # maps them to [-1, 1] exactly like the MNIST branch.
+        # NOTE: torchvision's default loader forces RGB; keep the original mode
+        # instead so that grayscale folders stay single-channel.
+        transform = T.Compose([
+            T.Resize((cfg["image_size"], cfg["image_size"])),
+            T.ToTensor(),
+        ])
+
+        def _keep_mode_loader(path):
+            with open(path, "rb") as f:
+                img = Image.open(f)
+                img.load()
+            return img
+
+        return ImageFolder(cfg["data_root"], transform=transform,
+                           loader=_keep_mode_loader)
+
     raise ValueError(f"Unknown dataset: {cfg['dataset']}")
 
 

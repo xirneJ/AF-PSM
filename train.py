@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import inspect
 import math
 import os
 import shutil
@@ -13,7 +14,7 @@ from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
 from data import build_dataset, cycle
-from meanflow import MeanFlow
+from meanflow import MeanFlow, AFPSM
 from models.dit import MFDiT
 
 
@@ -69,10 +70,17 @@ if __name__ == '__main__':
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     mf_cfg = dict(cfg['meanflow'])
+    mf_mode = mf_cfg.pop('mode', 'i-meanflow')
     mf_cfg['channels'] = cfg['model']['in_channels']
     mf_cfg['image_size'] = cfg['model']['input_size']
     mf_cfg['num_classes'] = cfg['model']['num_classes']
-    meanflow = MeanFlow(**mf_cfg)
+    is_afpsm = mf_mode == 'af-psm'
+    if is_afpsm:
+        # keep only the kwargs AFPSM actually understands
+        valid = inspect.signature(AFPSM).parameters
+        meanflow = AFPSM(**{k: v for k, v in mf_cfg.items() if k in valid})
+    else:
+        meanflow = MeanFlow(mode=mf_mode, **mf_cfg)
 
     if vae is not None:
         model, vae, optimizer, train_dataloader = accelerator.prepare(
@@ -109,15 +117,16 @@ if __name__ == '__main__':
 
     if accelerator.is_main_process:
         n_params = sum(p.numel() for p in model_module.parameters())
-        print(f"MF mode: {meanflow.mode}")
+        print(f"MF mode: {mf_mode}")
         print(f"Model size: {n_params / 1e6:.2f}M")
         with open(cfg['log_file'], 'a') as f:
-            f.write(f"MF mode: {meanflow.mode}\n")
+            f.write(f"MF mode: {mf_mode}\n")
             f.write(f"Model size: {n_params / 1e6:.2f}M\n\n")
 
     global_step = 0
     grad_clip = cfg['grad_clip']
-    losses = log_fm_loss = log_mf_loss = log_mf_v_mse = log_grad_norm = 0.0
+    losses = log_grad_norm = 0.0
+    stats_sum = {}
 
     model.train()
     pbar = tqdm(
@@ -134,7 +143,12 @@ if __name__ == '__main__':
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample()
 
-        loss, mse_val = meanflow.loss(model, x, c)
+        if is_afpsm:
+            loss, mse_val = meanflow.loss(
+                model, x, c, step=global_step, total_steps=cfg['n_steps']
+            )
+        else:
+            loss, mse_val = meanflow.loss(model, x, c)
         accelerator.backward(loss)
         grad_norm = accelerator.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
@@ -144,35 +158,49 @@ if __name__ == '__main__':
 
         global_step += 1
         losses += loss.item()
-        log_fm_loss += mse_val['fm_loss'].item()
-        log_mf_loss += mse_val['mf_loss'].item()
-        log_mf_v_mse += mse_val['mf_v_mse'].item()
+        for k, v in mse_val.items():
+            stats_sum[k] = stats_sum.get(k, 0.0) + v.item()
         log_grad_norm += grad_norm.item()
 
         if accelerator.is_main_process:
-            pbar.set_postfix(
-                Loss=f"{loss.item():.4f}",
-                MF_V_MSE=f"{mse_val['mf_v_mse'].item():.4f}",
-                refresh=False,
-            )
+            post = dict(Loss=f"{loss.item():.4f}")
+            for k in ('pixel', 'freq', 'mid'):
+                if k in mse_val:
+                    post[k.capitalize()] = f"{mse_val[k].item():.4f}"
+            if 'alpha_pred' in mse_val:
+                post['A'] = f"{mse_val['alpha_pred'].item():.3f}"
+            if 'mf_v_mse' in mse_val:
+                post['MF_V_MSE'] = f"{mse_val['mf_v_mse'].item():.4f}"
+            pbar.set_postfix(**post, refresh=False)
 
         if accelerator.is_main_process and global_step % cfg['log_step'] == 0:
             s = cfg['log_step']
             with open(cfg['log_file'], 'a') as f:
                 lr = optimizer.param_groups[0]['lr']
+                parts = "    ".join(f"{k}: {v / s:.6f}" for k, v in stats_sum.items())
                 f.write(
                     f"{time.asctime(time.localtime(time.time()))}\n"
                     f"Step: {global_step}    LR: {lr:.6f}    Grad_Norm: {log_grad_norm / s:.6f}\n"
-                    f"Loss: {losses / s:.6f}    FM_Loss: {log_fm_loss / s:.6f}    "
-                    f"MF_Loss: {log_mf_loss / s:.6f}    MF_V_MSE: {log_mf_v_mse / s:.6f}\n"
+                    f"Loss: {losses / s:.6f}    {parts}\n"
                 )
-            losses = log_fm_loss = log_mf_loss = log_mf_v_mse = log_grad_norm = 0.0
+            losses = log_grad_norm = 0.0
+            stats_sum = {}
 
         if global_step % cfg['sample_step'] == 0:
             if accelerator.is_main_process:
-                z = meanflow.sample_each_class(
-                    model_module, n_per_class=1, classes=cfg['sample_classes']
-                )
+                if is_afpsm:
+                    z = meanflow.sample_each_class(
+                        model_module,
+                        n_per_class=1,
+                        classes=cfg['sample_classes'],
+                        sample_steps=cfg.get('sample_steps', 1),
+                        device=accelerator.device,
+                        adaptive=cfg.get('sample_adaptive', False),
+                    )
+                else:
+                    z = meanflow.sample_each_class(
+                        model_module, n_per_class=1, classes=cfg['sample_classes']
+                    )
                 if use_latent:
                     with torch.no_grad():
                         z = vae.decode(z).sample
