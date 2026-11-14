@@ -18,8 +18,12 @@ Examples
         --ckpt logs/afpsm_mnist_10k_*/ckpts/step_0010000.pt \
         --modes 1,2,2a --n_samples 10000 --name afpsm_10k --json fid_results.jsonl
 
-    # MeanFlow / iMF baseline (trained with configs/mnist.py)
-    python fid_eval.py --config configs/mnist.py \
+    # MeanFlow / iMF baseline (trained with configs/mnist.py --no_cfg)
+    # NOTE the --no_cfg: a baseline trained with train.py --no_cfg only saw
+    # w == 1, and MeanFlow.sample_each_class otherwise samples with the
+    # *midpoint* of cfg_scale (4.25 for [1.0, 7.5]), which would silently
+    # invalidate the comparison.
+    python fid_eval.py --config configs/mnist.py --no_cfg \
         --ckpt logs/<baseline_run>/ckpts/step_0010000.pt \
         --modes 1,2 --n_samples 10000 --name meanflow_10k --json fid_results.jsonl
 
@@ -43,6 +47,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.models import Inception_V3_Weights, inception_v3
+from torchvision.utils import make_grid, save_image
 
 from data import build_eval_dataset
 from meanflow import AFPSM, MeanFlow
@@ -67,6 +72,47 @@ def parse_mode(s):
     if s.endswith('a'):
         return int(s[:-1]), True
     return int(s), False
+
+
+def nfe_of(mode, sampler_name):
+    """Number of network forward passes needed by a sampling mode.
+
+    AF-PSM adaptive mode costs 3 forwards per interval (alpha prediction and the
+    two segments), which is 6 NFE for a 2-interval run -- NOT 2. Always report
+    this column when comparing models, otherwise adaptive-vs-plain comparisons
+    silently use different compute.
+    """
+    steps, adaptive = parse_mode(mode)
+    if adaptive and 'AFPSM' in str(sampler_name):
+        return steps * 3
+    return steps
+
+
+def apply_sampler_overrides(mf_cfg, no_cfg=False, cfg_scale=None):
+    """Align eval-time conditioning with train-time conditioning.
+
+    ``MeanFlow.sample_each_class`` calls ``sample_t_r(..., sample_cfg=False)``,
+    and in that branch the guidance scale is the *midpoint* of ``cfg_scale``
+    (e.g. 4.25 for [1.0, 7.5]). A baseline trained with ``train.py --no_cfg``
+    only ever saw w == 1, so it MUST be sampled with ``cfg_scale=None`` or the
+    FID comparison is invalid (the model sees an out-of-distribution w).
+    """
+    mf_cfg = dict(mf_cfg)
+    if no_cfg:
+        mf_cfg['cfg_scale'] = None
+    elif cfg_scale is not None:
+        mf_cfg['cfg_scale'] = cfg_scale
+    return mf_cfg
+
+
+def sampler_w_mode(sampler):
+    """Human-readable description of the guidance weight used at sampling."""
+    if not getattr(sampler, 'use_cfg_w', False):
+        return 'no-CFG (w=1)'
+    if getattr(sampler, 'cfg_w_fixed', None) is not None:
+        return f'fixed w={sampler.cfg_w_fixed:g}'
+    lo, hi = sampler.cfg_w_range
+    return f'cfg_scale=({lo:g},{hi:g}) -> sampling w={(lo + hi) / 2:g}'
 
 
 class InceptionFeatures(torch.nn.Module):
@@ -156,6 +202,13 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4,
                         help='dataloader workers for the reference split')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--no_cfg', action='store_true',
+                        help='sample with w=1; REQUIRED when the checkpoint was '
+                             'trained with train.py --no_cfg')
+    parser.add_argument('--cfg_scale', type=float, default=None,
+                        help='override the guidance scale used at sampling time')
+    parser.add_argument('--save_grids', type=str, default=None,
+                        help='optional directory: save one sample grid per mode')
     parser.add_argument('--json', type=str, default=None,
                         help='append one JSON line per (model, mode) result')
     parser.add_argument('--cache_dir', type=str, default='.cache/fid')
@@ -181,6 +234,7 @@ def main():
     mf_cfg['channels'] = cfg['model']['in_channels']
     mf_cfg['image_size'] = cfg['model']['input_size']
     mf_cfg['num_classes'] = cfg['model']['num_classes']
+    mf_cfg = apply_sampler_overrides(mf_cfg, args.no_cfg, args.cfg_scale)
     if mf_mode == 'af-psm':
         valid = inspect.signature(AFPSM).parameters
         sampler = AFPSM(**{k: v for k, v in mf_cfg.items() if k in valid})
@@ -190,6 +244,7 @@ def main():
     print(f'[{name}] ckpt: {ckpt}')
     print(f'[{name}] sampler={type(sampler).__name__} mode={mf_mode} '
           f'activation={getattr(model, "output_activation", "-")}')
+    print(f'[{name}] sampling guidance: {sampler_w_mode(sampler)}')
 
     detector = InceptionFeatures().to(device).eval()
 
@@ -211,14 +266,27 @@ def main():
 
     results = []
     n_classes = cfg['model']['num_classes']
+    sampler_name = type(sampler).__name__
     for mode in args.modes.split(','):
+        mode = mode.strip()
         torch.manual_seed(args.seed)
         imgs = generate_samples(sampler, model, args.n_samples, n_classes, mode, device)
         feats = features(imgs, detector, device, args.batch)
         score = fid_from_features(feats, ref_feats)
-        print(f'[{name}] mode={mode.strip():>4}  n={len(imgs)}  FID={score:.2f}')
+        nfe = nfe_of(mode, sampler_name)
+        if args.save_grids:
+            os.makedirs(args.save_grids, exist_ok=True)
+            # cap the grid size: a 10k-sample FID run would otherwise produce a
+            # 320 x 32000 px PNG. 100 images (10 rows x 10 classes) is plenty.
+            grid_imgs = imgs[:min(len(imgs), 100)]
+            grid = make_grid(grid_imgs, nrow=max(1, n_classes))
+            grid_path = os.path.join(args.save_grids, f'{name}_{mode}.png')
+            save_image(grid, grid_path)
+            print(f'[{name}] grid ({len(grid_imgs)} imgs) -> {grid_path}')
+        print(f'[{name}] mode={mode:>4}  NFE={nfe:>2}  n={len(imgs)}  FID={score:.2f}')
         results.append(dict(name=name, config=args.config, ckpt=ckpt,
-                            sampler=type(sampler).__name__, mode=mode.strip(),
+                            sampler=sampler_name, mode=mode, nfe=nfe,
+                            w_mode=sampler_w_mode(sampler),
                             n=len(imgs), n_ref=len(ref_feats), fid=score))
 
     if args.json:

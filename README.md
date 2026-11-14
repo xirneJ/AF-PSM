@@ -19,7 +19,7 @@ PyTorch implementation of [Mean Flows for One-step Generative Modeling](https://
 
 **AF-PSM**
   - `meanflow.mode: "af-psm"`: JVP-free interval-splitting training directly in pixel space
-  - Single `tanh` clean-image head + `alpha` split-ratio head (global pooling + MLP)
+  - Single clean-image head (unbounded by default; `tanh` was abandoned after it saturated — see below) + `alpha` split-ratio head (global pooling + MLP)
   - Frequency-consistency loss; 3 shared-parameter forwards; 4-loss objective
   - `configs/afpsm_mnist.py`, `configs/afpsm_cifar10.py`; `configs/smoke_cpu.py` + `smoke_test.py` for a CPU sanity check
 
@@ -66,25 +66,47 @@ python fid_eval.py --config configs/afpsm_mnist_10k.py \
   --ckpt logs/<afpsm_run>/ckpts/step_0010000.pt \
   --modes 1,2,2a --n_samples 10000 --name afpsm_10k --json fid_results.jsonl
 
-# MeanFlow / iMF baseline (same budget, CFG disabled)
-python fid_eval.py --config configs/mnist.py \
+# MeanFlow / iMF baseline (same budget, CFG disabled at *both* train and eval time)
+# --no_cfg is REQUIRED here: MeanFlow.sample_each_class otherwise samples with the
+# midpoint of cfg_scale (4.25 for [1.0, 7.5]) -- an out-of-distribution w for a
+# model trained with --no_cfg, which silently invalidates the comparison.
+python fid_eval.py --config configs/mnist.py --no_cfg \
   --ckpt logs/<baseline_run>/ckpts/step_0010000.pt \
   --modes 1,2 --n_samples 10000 --name meanflow_10k --json fid_results.jsonl
 
-# print the collected table
-python - <<'PY'
-import json
-for line in open('fid_results.jsonl'):
-    r = json.loads(line)
-    print(f"{r['name']:>28}  mode={r['mode']:>4}  n={r['n']:>6}  FID={r['fid']:8.2f}")
-PY
+# paper-ready table: NFE column + delta vs a chosen baseline, matched by NFE
+python fid_table.py --json fid_results.jsonl --baseline meanflow_10k
+
+# optional: dump one sample grid per mode for visual comparison
+python fid_eval.py --config configs/afpsm_mnist.py --ckpt <...> \
+  --modes 1,2,2a --n_samples 100 --save_grids eval_grids
 ```
+
+**Report FID vs NFE, not vs "steps".** NFE is the number of network forward passes per sample: AF-PSM `1 / 2 / 2a` cost NFE `1 / 2 / 6` (adaptive evaluates alpha prediction plus two segments per interval, see `AFPSM.sample_each_class`), while MeanFlow `1 / 2` cost NFE `1 / 2`. `fid_eval.py` records the NFE in every JSONL row and `fid_table.py` prints it, so adaptive-vs-plain comparisons stay honest — compare `2a` against a 6-NFE baseline run (`--modes 6`). For the main paper table prefer CIFAR-10; MNIST FID through the 299x299 Inception resize is low-sensitivity.
 
 Train a matched MeanFlow/iMF baseline (same steps, batch, schedule; CFG disabled for a fair comparison with AF-PSM):
 
 ```bash
 python train.py --config configs/mnist.py --n_steps 10000 --batch_size 32 \
   --warmup_steps 500 --no_cfg --run_suffix imf10k
+```
+
+### Reproducibility, long runs, and resume
+
+Runs are seeded with `--seed` (default `0`; sets torch / numpy / cuda RNG — `MeanFlow` draws its `(t, r)` pairs from numpy's global RNG, so this matters for reproducibility). `--ckpt_every N` saves a checkpoint every N steps, which matters for multi-hour runs on a shared GPU. `--resume PATH` continues a run: model weights are restored and the step counter plus LR schedule are fast-forwarded to the checkpoint's step, while optimizer state is re-initialised (pass the **total** `--n_steps`, not the remaining steps).
+
+```bash
+# periodic checkpoints every 5k steps
+python train.py --config configs/mnist.py --n_steps 30000 --ckpt_every 5000 --seed 0
+
+# resume after a crash / OOM kill: pass the TOTAL n_steps
+python train.py --config configs/mnist.py --n_steps 30000 --ckpt_every 5000 \
+  --resume logs/<run>/ckpts/step_0025000.pt --seed 0
+
+# multi-seed runs (papers need >= 2-3 seeds)
+for s in 0 1 2; do
+  python train.py --config configs/afpsm_mnist.py --n_steps 30000 --seed $s --run_suffix seed$s
+done
 ```
 
 ## Usage

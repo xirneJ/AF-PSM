@@ -3,10 +3,12 @@ import importlib.util
 import inspect
 import math
 import os
+import re
 import shutil
 import time
 from datetime import datetime
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
@@ -50,6 +52,14 @@ if __name__ == '__main__':
                         help='override scheduler warmup (match schedules across models)')
     parser.add_argument('--no_cfg', action='store_true',
                         help='disable CFG-scale conditioning (fair comparison with AF-PSM)')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='global RNG seed (torch/numpy/cuda); papers need >=2-3 seeds')
+    parser.add_argument('--ckpt_every', type=int, default=0,
+                        help='save a checkpoint every N steps (0 = final checkpoint only)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='resume from a checkpoint .pt: model weights are restored and '
+                             'the step counter / LR schedule are fast-forwarded '
+                             '(optimizer state is re-initialised). Pass the TOTAL n_steps.')
     args = parser.parse_args()
 
     spec = importlib.util.spec_from_file_location('train_config', args.config)
@@ -89,6 +99,15 @@ if __name__ == '__main__':
         cfg['scheduler']['warmup_steps'] = args.warmup_steps
     if args.no_cfg:
         cfg['meanflow']['cfg_scale'] = None
+    if args.resume and not os.path.exists(args.resume):
+        raise FileNotFoundError(f'--resume checkpoint not found: {args.resume}')
+
+    # ---- reproducibility: seed everything that affects the loss / sampling ----
+    # (MeanFlow.sample_t_r draws its (t, r) pairs from numpy's global RNG)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
 
     accelerator = Accelerator(
         mixed_precision=cfg.get('mixed_precision', 'bf16'),
@@ -103,6 +122,7 @@ if __name__ == '__main__':
               f"warmup={cfg.get('scheduler', {}).get('warmup_steps', 0)} "
               f"precision={cfg.get('mixed_precision', 'bf16')}")
         print(f"[data] dataset={cfg['dataset']} root={resolve_data_root(cfg)}")
+        print(f"[seed] {args.seed} | ckpt_every={args.ckpt_every} | resume={args.resume}")
 
     train_dataloader = torch.utils.data.DataLoader(
         build_dataset(cfg),
@@ -119,6 +139,26 @@ if __name__ == '__main__':
         vae = AutoencoderKL.from_pretrained(cfg['vae_id']).to(accelerator.device)
 
     model = MFDiT(**cfg['model']).to(accelerator.device)
+
+    # ---- optional resume (model weights + step counter; optimizer is fresh) ----
+    resume_step = 0
+    if args.resume:
+        state = torch.load(args.resume, map_location=accelerator.device)
+        if isinstance(state, dict) and 'model' in state:
+            state = state['model']          # tolerate wrapped checkpoints
+        model.load_state_dict(state)
+        match = re.search(r'step_(\d+)', os.path.basename(args.resume))
+        resume_step = int(match.group(1)) if match else 0
+        if accelerator.is_main_process:
+            print(f"[resume] {args.resume} -> start step {resume_step} "
+                  f"(optimizer state re-initialised)")
+        if resume_step >= cfg['n_steps']:
+            if accelerator.is_main_process:
+                print(f"[resume] start step {resume_step} >= n_steps "
+                      f"{cfg['n_steps']}: nothing to do, lower --n_steps or pick "
+                      f"an earlier checkpoint")
+            raise SystemExit(0)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
 
     scheduler = None
@@ -138,6 +178,9 @@ if __name__ == '__main__':
             return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        # resuming: fast-forward the (stateless) schedule to the resumed step
+        for _ in range(resume_step):
+            scheduler.step()
 
     mf_cfg = dict(cfg['meanflow'])
     mf_mode = mf_cfg.pop('mode', 'i-meanflow')
@@ -193,7 +236,7 @@ if __name__ == '__main__':
             f.write(f"MF mode: {mf_mode}\n")
             f.write(f"Model size: {n_params / 1e6:.2f}M\n\n")
 
-    global_step = 0
+    global_step = resume_step
     grad_clip = cfg['grad_clip']
     losses = log_grad_norm = 0.0
     stats_sum = {}
@@ -201,7 +244,7 @@ if __name__ == '__main__':
 
     model.train()
     pbar = tqdm(
-        range(cfg['n_steps']),
+        range(global_step, cfg['n_steps']),
         desc=cfg['name'],
         dynamic_ncols=True,
         disable=not accelerator.is_main_process,
@@ -263,6 +306,16 @@ if __name__ == '__main__':
             log_t0 = time.time()
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
+
+        # periodic checkpoint, so a 6h run that gets OOM-killed is not lost
+        if (args.ckpt_every > 0 and global_step % args.ckpt_every == 0
+                and global_step < cfg['n_steps']):
+            if accelerator.is_main_process:
+                accelerator.save(
+                    model_module.state_dict(),
+                    os.path.join(cfg['ckpt_dir'], f'step_{global_step:07d}.pt'),
+                )
+            accelerator.wait_for_everyone()
 
         if global_step % cfg['sample_step'] == 0:
             if accelerator.is_main_process:
