@@ -34,6 +34,13 @@ if __name__ == '__main__':
     parser.add_argument('--data_root', type=str, default=None,
                         help='dataset root (relative paths resolve against the repo root, '
                              'e.g. data/mnist)')
+    parser.add_argument('--output_activation', type=str, default=None,
+                        choices=['tanh', 'clamp', 'none'],
+                        help='AF-PSM clean-image head activation (diagnostics)')
+    parser.add_argument('--precision', type=str, default=None,
+                        choices=['bf16', 'fp16', 'no'],
+                        help='mixed precision (diagnostics)')
+    parser.add_argument('--lr', type=float, default=None)
     args = parser.parse_args()
 
     spec = importlib.util.spec_from_file_location('train_config', args.config)
@@ -53,6 +60,12 @@ if __name__ == '__main__':
         cfg['model']['grad_checkpoint'] = bool(args.ckpt)
     if args.data_root is not None:
         cfg['data_root'] = args.data_root
+    if args.output_activation is not None:
+        cfg['model']['output_activation'] = args.output_activation
+    if args.precision is not None:
+        cfg['mixed_precision'] = args.precision
+    if args.lr is not None:
+        cfg['lr'] = args.lr
 
     accelerator = Accelerator(
         mixed_precision=cfg.get('mixed_precision', 'bf16'),
@@ -61,7 +74,9 @@ if __name__ == '__main__':
     if accelerator.is_main_process:
         print(f"[override] batch_size={cfg['batch_size']} n_steps={cfg['n_steps']} "
               f"flash={cfg['meanflow'].get('use_flash_attention', False)} "
-              f"grad_checkpoint={cfg['model'].get('grad_checkpoint', False)}")
+              f"grad_checkpoint={cfg['model'].get('grad_checkpoint', False)} "
+              f"output_activation={cfg['model'].get('output_activation', 'tanh')} "
+              f"precision={cfg.get('mixed_precision', 'bf16')}")
         print(f"[data] dataset={cfg['dataset']} root={resolve_data_root(cfg)}")
 
     train_dataloader = torch.utils.data.DataLoader(
