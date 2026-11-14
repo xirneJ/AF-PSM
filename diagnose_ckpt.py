@@ -37,6 +37,10 @@ def main():
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--n', type=int, default=4)
+    parser.add_argument('--output_activation', type=str, default=None,
+                        choices=['tanh', 'clamp', 'none'],
+                        help='override the config activation (use tanh to diagnose '
+                             'checkpoints trained with the old tanh head)')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -49,6 +53,8 @@ def main():
         ckpt = candidates[-1]
     state = torch.load(ckpt, map_location=args.device)
     model.load_state_dict(state)
+    if args.output_activation is not None:
+        model.output_activation = args.output_activation
     model.eval()
     print(f'ckpt: {ckpt}')
     print(f'model: output_mode={model.output_mode} '
