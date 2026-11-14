@@ -84,6 +84,8 @@ python fid_eval.py --config configs/afpsm_mnist.py --ckpt <...> \
 
 **Report FID vs NFE, not vs "steps".** NFE is the number of network forward passes per sample: AF-PSM `1 / 2 / 2a` cost NFE `1 / 2 / 6` (adaptive evaluates alpha prediction plus two segments per interval, see `AFPSM.sample_each_class`), while MeanFlow `1 / 2` cost NFE `1 / 2`. `fid_eval.py` records the NFE in every JSONL row and `fid_table.py` prints it, so adaptive-vs-plain comparisons stay honest — compare `2a` against a 6-NFE baseline run (`--modes 6`). For the main paper table prefer CIFAR-10; MNIST FID through the 299x299 Inception resize is low-sensitivity.
 
+Generation is chunked (`--gen_chunk`, default 250 images per forward): a single 10k-image batch needs ~5 GiB for one `(N, T, D)` activation tensor alone and OOMs on a shared GPU. Lower `--gen_chunk` (e.g. 100) when the card is nearly full. Chunking keeps the same noise stream for every mode, so 1/2/2a stay paired.
+
 Train a matched MeanFlow/iMF baseline (same steps, batch, schedule; CFG disabled for a fair comparison with AF-PSM):
 
 ```bash

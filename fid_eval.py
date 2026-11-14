@@ -177,14 +177,30 @@ def fid_from_features(f1, f2):
                  - 2.0 * covmean_trace)
 
 
-def generate_samples(sampler, model, n_samples, n_classes, mode, device):
+def generate_samples(sampler, model, n_samples, n_classes, mode, device,
+                     gen_chunk=250):
+    """Class-balanced sampling, chunked to bound peak GPU memory.
+
+    Generating all 10k FID samples in a single forward pass needs ~5 GiB for one
+    (N, T, D) activation tensor alone and OOMs on a shared GPU (observed on a
+    32 GB card with ~2 GB free). Chunking keeps the *same* noise stream for every
+    sampling mode (same seed -> same starting z per chunk), so step1/step2/2a
+    remain paired comparisons.
+    """
     steps, adaptive = parse_mode(mode)
     n_per_class = max(1, n_samples // n_classes)
-    kwargs = dict(n_per_class=n_per_class, classes=list(range(n_classes)),
-                  sample_steps=steps, device=device)
-    if isinstance(sampler, AFPSM):
-        kwargs['adaptive'] = adaptive
-    return sampler.sample_each_class(model, **kwargs)
+    per_class_chunk = max(1, gen_chunk // max(1, n_classes))
+    chunks = []
+    done = 0
+    while done < n_per_class:
+        take = min(per_class_chunk, n_per_class - done)
+        kwargs = dict(n_per_class=take, classes=list(range(n_classes)),
+                      sample_steps=steps, device=device)
+        if isinstance(sampler, AFPSM):
+            kwargs['adaptive'] = adaptive
+        chunks.append(sampler.sample_each_class(model, **kwargs))
+        done += take
+    return torch.cat(chunks, dim=0)
 
 
 def main():
@@ -199,6 +215,9 @@ def main():
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--batch', type=int, default=64)
+    parser.add_argument('--gen_chunk', type=int, default=250,
+                        help='images generated per forward chunk; lower it (e.g. 100) '
+                             'if the shared GPU is nearly full')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='dataloader workers for the reference split')
     parser.add_argument('--seed', type=int, default=0)
@@ -270,7 +289,8 @@ def main():
     for mode in args.modes.split(','):
         mode = mode.strip()
         torch.manual_seed(args.seed)
-        imgs = generate_samples(sampler, model, args.n_samples, n_classes, mode, device)
+        imgs = generate_samples(sampler, model, args.n_samples, n_classes, mode,
+                                device, gen_chunk=args.gen_chunk)
         feats = features(imgs, detector, device, args.batch)
         score = fid_from_features(feats, ref_feats)
         nfe = nfe_of(mode, sampler_name)
