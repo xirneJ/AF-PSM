@@ -102,6 +102,44 @@ def build_dataset(cfg):
     raise ValueError(f"Unknown dataset: {cfg['dataset']}")
 
 
+def build_eval_dataset(cfg, train=False):
+    """Deterministic evaluation split (no random augmentation); images in [0, 1]."""
+    root = resolve_data_root(cfg)
+
+    if cfg["dataset"] == "mnist":
+        root.mkdir(parents=True, exist_ok=True)
+        return torchvision.datasets.MNIST(
+            root=str(root), train=train, download=True,
+            transform=T.Compose([
+                T.Resize((cfg["image_size"], cfg["image_size"])),
+                T.ToTensor(),
+            ]),
+        )
+
+    if cfg["dataset"] == "cifar10":
+        root.mkdir(parents=True, exist_ok=True)
+        return torchvision.datasets.CIFAR10(
+            root=str(root), train=train, download=True,
+            transform=T.Compose([T.ToTensor()]),
+        )
+
+    if cfg["dataset"] in ("imagenet", "folder"):
+        transform = T.Compose([
+            T.Resize((cfg["image_size"], cfg["image_size"])),
+            T.ToTensor(),
+        ])
+
+        def _keep_mode_loader(path):
+            with open(path, "rb") as f:
+                img = Image.open(f)
+                img.load()
+            return img
+
+        return ImageFolder(str(root), transform=transform, loader=_keep_mode_loader)
+
+    raise ValueError(f"Unknown dataset: {cfg['dataset']}")
+
+
 def cycle(iterable):
     while True:
         for item in iterable:

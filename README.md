@@ -54,6 +54,39 @@ python train.py --config configs/afpsm_mnist_10k.py --batch_size 16 --flash 1 --
 
 Switches in the `meanflow` block: `alpha_curriculum` (`linear` = 1 -> 0.01, plus `to_half`, `triangular`, `const`, `none`), `freq_loss` (`rel_hp` = ortho rfft2 with soft high-pass weighting and energy normalization, or the literal `mse`), `alpha_weight` / `freq_weight` / `mid_weight`, `alpha_stopgrad`, `detach_xs`, `use_flash_attention` (memory-efficient SDPA; safe now that there is no JVP). `model.grad_checkpoint=True` trades ~20-30% compute for much lower activation memory.
 
+## FID evaluation
+
+`fid_eval.py` computes FID with a standard InceptionV3 detector (torchvision ImageNet weights, auto-downloaded on first use) and appends one JSONL row per (model, sampling mode), so models can be compared in one table.
+
+Fair-comparison protocol: **same detector, same reference set (dataset test split), same number of class-balanced samples** (default 10,000). FID on 32x32 data goes through the Inception resize to 299, so absolute numbers are **not** comparable to literature FID — use them only for the *relative* comparison between your own models.
+
+```bash
+# AF-PSM: 1-step / 2-step / adaptive
+python fid_eval.py --config configs/afpsm_mnist_10k.py \
+  --ckpt logs/<afpsm_run>/ckpts/step_0010000.pt \
+  --modes 1,2,2a --n_samples 10000 --name afpsm_10k --json fid_results.jsonl
+
+# MeanFlow / iMF baseline (same budget, CFG disabled)
+python fid_eval.py --config configs/mnist.py \
+  --ckpt logs/<baseline_run>/ckpts/step_0010000.pt \
+  --modes 1,2 --n_samples 10000 --name meanflow_10k --json fid_results.jsonl
+
+# print the collected table
+python - <<'PY'
+import json
+for line in open('fid_results.jsonl'):
+    r = json.loads(line)
+    print(f"{r['name']:>28}  mode={r['mode']:>4}  n={r['n']:>6}  FID={r['fid']:8.2f}")
+PY
+```
+
+Train a matched MeanFlow/iMF baseline (same steps, batch, schedule; CFG disabled for a fair comparison with AF-PSM):
+
+```bash
+python train.py --config configs/mnist.py --n_steps 10000 --batch_size 32 \
+  --warmup_steps 500 --no_cfg --run_suffix imf10k
+```
+
 ## Usage
 
 `i-meanflow` (`meanflow.mode: "i-meanflow"`) is more stable and recommended for your projects. `meanflow` mode is kept for reference.

@@ -134,7 +134,11 @@ def main():
             batch = next(iter(loader))[0]
             batch = afpsm.normer.norm(batch).to(args.device)
             print(f'\n-- real data stats ({batch.shape[0]} images) --')
-            print(f'  mean={batch.mean():.4f} std={batch.std():.4f}')
+            print(f'  normalized: mean={batch.mean():.4f} std={batch.std():.4f}')
+            if cfg['meanflow']['normalizer'][0] == 'minmax':
+                # samples are reported in [0, 1] (after unnorm), so map data too
+                batch01 = (batch + 1) / 2
+                print(f'  in [0, 1] : mean={batch01.mean():.4f} std={batch01.std():.4f}')
         except Exception as e:  # noqa: BLE001 - data is optional for this eval
             print(f'\n[data_stats] skipped: {e}')
 

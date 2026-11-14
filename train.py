@@ -41,6 +41,15 @@ if __name__ == '__main__':
                         choices=['bf16', 'fp16', 'no'],
                         help='mixed precision (diagnostics)')
     parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--alpha_curriculum', type=str, default=None,
+                        choices=['linear', 'to_half', 'triangular', 'const', 'none'])
+    parser.add_argument('--alpha_weight', type=float, default=None)
+    parser.add_argument('--freq_weight', type=float, default=None)
+    parser.add_argument('--mid_weight', type=float, default=None)
+    parser.add_argument('--warmup_steps', type=int, default=None,
+                        help='override scheduler warmup (match schedules across models)')
+    parser.add_argument('--no_cfg', action='store_true',
+                        help='disable CFG-scale conditioning (fair comparison with AF-PSM)')
     args = parser.parse_args()
 
     spec = importlib.util.spec_from_file_location('train_config', args.config)
@@ -66,6 +75,20 @@ if __name__ == '__main__':
         cfg['mixed_precision'] = args.precision
     if args.lr is not None:
         cfg['lr'] = args.lr
+    if args.alpha_curriculum is not None:
+        cfg['meanflow']['alpha_curriculum'] = args.alpha_curriculum
+    if args.alpha_weight is not None:
+        cfg['meanflow']['alpha_weight'] = args.alpha_weight
+    if args.freq_weight is not None:
+        cfg['meanflow']['freq_weight'] = args.freq_weight
+    if args.mid_weight is not None:
+        cfg['meanflow']['mid_weight'] = args.mid_weight
+    if args.warmup_steps is not None:
+        if cfg.get('scheduler') is None:
+            cfg['scheduler'] = {}
+        cfg['scheduler']['warmup_steps'] = args.warmup_steps
+    if args.no_cfg:
+        cfg['meanflow']['cfg_scale'] = None
 
     accelerator = Accelerator(
         mixed_precision=cfg.get('mixed_precision', 'bf16'),
@@ -76,6 +99,8 @@ if __name__ == '__main__':
               f"flash={cfg['meanflow'].get('use_flash_attention', False)} "
               f"grad_checkpoint={cfg['model'].get('grad_checkpoint', False)} "
               f"output_activation={cfg['model'].get('output_activation', 'tanh')} "
+              f"alpha_curriculum={cfg['meanflow'].get('alpha_curriculum', 'linear')} "
+              f"warmup={cfg.get('scheduler', {}).get('warmup_steps', 0)} "
               f"precision={cfg.get('mixed_precision', 'bf16')}")
         print(f"[data] dataset={cfg['dataset']} root={resolve_data_root(cfg)}")
 
