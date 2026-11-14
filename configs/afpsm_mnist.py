@@ -28,7 +28,10 @@ config = dict(
         num_classes=10,
         max_cfg=7.5,
         output_mode='x',          # single clean-image head + alpha head
-        output_activation='tanh', # x in [-1, 1]
+        # UNBOUNDED output: tanh saturates on the minmax ±1 targets (dead
+        # gradients; observed in the first 10k-step run). Samples are clipped
+        # back to [0, 1] by Normalizer.unnorm. Options: 'tanh', 'clamp', 'none'.
+        output_activation='none',
         alpha_min=0.01,
     ),
     meanflow=dict(

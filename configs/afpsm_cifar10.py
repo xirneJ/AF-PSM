@@ -27,7 +27,9 @@ config = dict(
         num_classes=10,
         max_cfg=7.5,
         output_mode='x',
-        output_activation='tanh',
+        # UNBOUNDED output (tanh saturates on minmax ±1 targets); 'tanh'/'clamp'
+        # remain available for ablation
+        output_activation='none',
         alpha_min=0.01,
     ),
     meanflow=dict(

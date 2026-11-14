@@ -35,7 +35,10 @@ config = dict(
         num_classes=10,
         max_cfg=7.5,
         output_mode='x',
-        output_activation='tanh',
+        # UNBOUNDED output: the tanh head saturates on minmax ±1 targets and
+        # kills gradients (observed in the first 10k-step run). Samples are
+        # clipped to [0, 1] by Normalizer.unnorm. Ablation: 'tanh' / 'clamp'.
+        output_activation='none',
         alpha_min=0.01,
         grad_checkpoint=True,
     ),

@@ -28,7 +28,7 @@ PyTorch implementation of [Mean Flows for One-step Generative Modeling](https://
 AF-PSM replaces MeanFlow's JVP-based differential identity with [SplitMeanFlow](https://arxiv.org/abs/2507.16884)'s algebraic interval-splitting identity, re-expressed in **pixel space** (predict the image instead of the average velocity). No `torch.autograd.functional.jvp` is used anywhere, so Flash Attention can be enabled unconditionally.
 
 - trajectory convention: `z_t = (1-t) x + t e`, `v = e - x`, `t > r` while training
-- the network predicts the clean image directly: `x_hat, alpha = model(z_t, t, r)` with `x_hat = tanh(...)` and `alpha` in `[alpha_min, 1]`
+- the network predicts the clean image directly: `x_hat, alpha = model(z_t, t, r)` with `alpha` in `[alpha_min, 1]`; the clean-image head is **unbounded by default** (`output_activation='none'` — `tanh` saturates on the minmax ±1 targets and kills gradients; `'tanh'`/`'clamp'` remain for ablation, and samples are always clipped to `[0, 1]` by the normalizer)
 - the dynamic split point is `s = alpha * r + (1 - alpha) * t`; the intermediate sample is reconstructed in closed form from the linearity of the path: `z_s = (1 - s/t) * x_hat_s + (s/t) * z_t`
 - 3 shared-parameter forwards, 4 losses (pixel anchoring, frequency consistency, exact midpoint supervision, alpha curriculum), zero JVP
 
