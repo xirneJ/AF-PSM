@@ -22,6 +22,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--run_suffix', type=str, default=None)
+    # quick resource/scale overrides, so a shared GPU can be probed without
+    # editing the config file
+    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--n_steps', type=int, default=None)
+    parser.add_argument('--flash', type=int, default=None, choices=[0, 1],
+                        help='1: memory-efficient SDPA attention (AF-PSM only)')
+    parser.add_argument('--ckpt', type=int, default=None, choices=[0, 1],
+                        help='1: gradient checkpointing in the DiT blocks')
+    parser.add_argument('--sample_steps', type=int, default=None)
     args = parser.parse_args()
 
     spec = importlib.util.spec_from_file_location('train_config', args.config)
@@ -29,10 +38,25 @@ if __name__ == '__main__':
     spec.loader.exec_module(module)
     cfg = module.config
 
+    if args.batch_size is not None:
+        cfg['batch_size'] = args.batch_size
+    if args.n_steps is not None:
+        cfg['n_steps'] = args.n_steps
+    if args.sample_steps is not None:
+        cfg['sample_steps'] = args.sample_steps
+    if args.flash is not None:
+        cfg['meanflow']['use_flash_attention'] = bool(args.flash)
+    if args.ckpt is not None:
+        cfg['model']['grad_checkpoint'] = bool(args.ckpt)
+
     accelerator = Accelerator(
         mixed_precision=cfg.get('mixed_precision', 'bf16'),
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
     )
+    if accelerator.is_main_process:
+        print(f"[override] batch_size={cfg['batch_size']} n_steps={cfg['n_steps']} "
+              f"flash={cfg['meanflow'].get('use_flash_attention', False)} "
+              f"grad_checkpoint={cfg['model'].get('grad_checkpoint', False)}")
 
     train_dataloader = torch.utils.data.DataLoader(
         build_dataset(cfg),
@@ -127,6 +151,7 @@ if __name__ == '__main__':
     grad_clip = cfg['grad_clip']
     losses = log_grad_norm = 0.0
     stats_sum = {}
+    log_t0 = time.time()
 
     model.train()
     pbar = tqdm(
@@ -175,16 +200,23 @@ if __name__ == '__main__':
 
         if accelerator.is_main_process and global_step % cfg['log_step'] == 0:
             s = cfg['log_step']
+            elapsed = time.time() - log_t0
+            mem_peak = (torch.cuda.max_memory_allocated() / 2**30
+                        if torch.cuda.is_available() else 0.0)
             with open(cfg['log_file'], 'a') as f:
                 lr = optimizer.param_groups[0]['lr']
                 parts = "    ".join(f"{k}: {v / s:.6f}" for k, v in stats_sum.items())
                 f.write(
                     f"{time.asctime(time.localtime(time.time()))}\n"
-                    f"Step: {global_step}    LR: {lr:.6f}    Grad_Norm: {log_grad_norm / s:.6f}\n"
+                    f"Step: {global_step}    LR: {lr:.6f}    Grad_Norm: {log_grad_norm / s:.6f}    "
+                    f"Step_time: {elapsed / s:.3f}s    Mem_peak: {mem_peak:.2f}GB\n"
                     f"Loss: {losses / s:.6f}    {parts}\n"
                 )
             losses = log_grad_norm = 0.0
             stats_sum = {}
+            log_t0 = time.time()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
 
         if global_step % cfg['sample_step'] == 0:
             if accelerator.is_main_process:

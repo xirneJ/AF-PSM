@@ -35,10 +35,24 @@ AF-PSM replaces MeanFlow's JVP-based differential identity with [SplitMeanFlow](
 ```bash
 python train.py --config configs/afpsm_mnist.py                  # MNIST (GPU)
 python train.py --config configs/afpsm_cifar10.py                # CIFAR-10 (GPU)
-python train.py --config configs/smoke_cpu.py                    # ~400-step CPU sanity check
+python train.py --config configs/afpsm_mnist_10k.py              # short 10k-step validation run
+python train.py --config configs/smoke_cpu.py                    # ~200-step CPU sanity check
 ```
 
-Switches in the `meanflow` block: `alpha_curriculum` (`linear` = 1 -> 0.01, plus `to_half`, `triangular`, `const`, `none`), `freq_loss` (`rel_hp` = ortho rfft2 with soft high-pass weighting and energy normalization, or the literal `mse`), `alpha_weight` / `freq_weight` / `mid_weight`, `alpha_stopgrad`, `detach_xs`.
+Shared-GPU helpers:
+
+```bash
+# measure step time / peak memory for one (batch, flash, ckpt) config;
+# run one config per process (fresh CUDA allocator)
+python bench.py --batch 16 --flash 1 --ckpt 1
+
+# CLI overrides, no config edit needed
+python train.py --config configs/afpsm_mnist_10k.py --batch_size 16 --flash 1 --ckpt 1
+```
+
+`train.py` logs `Step_time` and `Mem_peak` every `log_step`, which makes it easy to tune `batch_size` on a shared GPU.
+
+Switches in the `meanflow` block: `alpha_curriculum` (`linear` = 1 -> 0.01, plus `to_half`, `triangular`, `const`, `none`), `freq_loss` (`rel_hp` = ortho rfft2 with soft high-pass weighting and energy normalization, or the literal `mse`), `alpha_weight` / `freq_weight` / `mid_weight`, `alpha_stopgrad`, `detach_xs`, `use_flash_attention` (memory-efficient SDPA; safe now that there is no JVP). `model.grad_checkpoint=True` trades ~20-30% compute for much lower activation memory.
 
 ## Usage
 
@@ -65,6 +79,7 @@ accelerate launch --num_processes 2 train.py --config configs/mnist.py
 | `configs/cifar10.py` | CIFAR-10 |
 | `configs/imagenet_latent.py` | ImageNet (latent, VAE) |
 | `configs/afpsm_mnist.py` | MNIST (AF-PSM, JVP-free) |
+| `configs/afpsm_mnist_10k.py` | MNIST (AF-PSM, 10k-step validation run) |
 | `configs/afpsm_cifar10.py` | CIFAR-10 (AF-PSM, JVP-free) |
 | `configs/smoke_cpu.py` | MNIST, tiny CPU sanity check |
 

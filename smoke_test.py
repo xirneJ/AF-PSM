@@ -161,8 +161,8 @@ def main():
           f"keys={sorted(stats_uv)}")
 
     # ---------------- 7) real config wiring (same path as train.py) --------
-    cfg_path = Path(__file__).resolve().parent / 'configs' / 'afpsm_mnist.py'
-    spec = importlib.util.spec_from_file_location('cfg_afpsm_mnist', cfg_path)
+    cfg_path = Path(__file__).resolve().parent / 'configs' / 'afpsm_mnist_10k.py'
+    spec = importlib.util.spec_from_file_location('cfg_afpsm_mnist_10k', cfg_path)
     cfg_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cfg_mod)
     cfg = cfg_mod.config
@@ -184,7 +184,37 @@ def main():
     n_params = sum(p.numel() for p in model_real.parameters())
     print(f"[7] real config wiring ok | mode={mf_mode} | "
           f"{n_params / 1e6:.2f}M params | loss={loss_real.item():.4f} | "
-          f"alpha={stats_real['alpha_pred'].item():.3f}")
+          f"alpha={stats_real['alpha_pred'].item():.3f} | "
+          f"grad_ckpt={cfg['model'].get('grad_checkpoint', False)} | "
+          f"flash={cfg['meanflow'].get('use_flash_attention', False)}")
+
+    # ---------------- 8) memory-saving switches (grad ckpt / SDPA flag) -----
+    model_ckpt = build_model(C, H)
+    model_ckpt.grad_checkpoint = True          # exercise the checkpoint branch
+    model_ckpt.train()
+    total_ck, _ = afpsm.loss(model_ckpt, x, c, step=0, total_steps=1000)
+    total_ck.backward()
+    assert torch.isfinite(total_ck)
+    n_ck_none = sum(1 for p in model_ckpt.parameters()
+                    if p.requires_grad and p.grad is None)
+    assert n_ck_none == 0
+    print(f"[8] grad_checkpoint ok | loss {total_ck.item():.4f} | all params get grads")
+
+    afpsm_sdpa = AFPSM(
+        channels=C, image_size=H, num_classes=10,
+        normalizer=['minmax', None, None], time_dist=['uniform'],
+        use_flash_attention=True,          # on CPU this falls back to native attention
+    )
+    model_sdpa = build_model(C, H)
+    total_sdpa, _ = afpsm_sdpa.loss(model_sdpa, x, c, step=0, total_steps=1000)
+    total_sdpa.backward()
+    assert torch.isfinite(total_sdpa)
+    imgs_sdpa = afpsm_sdpa.sample_each_class(
+        model_sdpa, n_per_class=1, classes=[0, 1], sample_steps=2, device='cpu'
+    )
+    assert torch.isfinite(imgs_sdpa).all()
+    print(f"[8b] use_flash_attention plumbing ok | loss {total_sdpa.item():.4f} | "
+          f"sampler ok")
 
     print("\nALL SMOKE TESTS PASSED")
 

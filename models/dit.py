@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from functools import partial
+from torch.utils.checkpoint import checkpoint
 from timm.models.vision_transformer import PatchEmbed, Mlp
 
 
@@ -88,9 +89,18 @@ class Attention(nn.Module):
         attn = attn.softmax(dim=-1)
         return attn @ v
 
-    def _flash_attention(self, q, k, v):
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+    def _memory_efficient_attention(self, q, k, v):
+        """Let PyTorch pick flash / mem-efficient / math kernels.
+
+        Unlike forcing SDPBackend.FLASH_ATTENTION, this falls back safely on
+        devices/dtypes where fused kernels are unavailable.  This path is only
+        used when `use_flash_attention=True`, so the JVP baseline (which must
+        stay on the naive path) is unaffected.
+        """
+        try:
             return F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        except Exception:
+            return self._native_attention(q, k, v)
 
     def forward(self, x, use_flash_attention=False):
         B, N, C = x.shape
@@ -104,7 +114,7 @@ class Attention(nn.Module):
             and q.is_cuda
             and q.dtype in (torch.float16, torch.bfloat16)
         ):
-            x = self._flash_attention(q, k, v)
+            x = self._memory_efficient_attention(q, k, v)
         else:
             x = self._native_attention(q, k, v)
 
@@ -169,6 +179,7 @@ class MFDiT(nn.Module):
         output_mode='uv',
         output_activation='tanh',
         alpha_min=0.01,
+        grad_checkpoint=False,
     ):
         """
         output_mode:
@@ -177,6 +188,8 @@ class MFDiT(nn.Module):
         output_activation: activation applied to the clean image head ('tanh',
                            'clamp' or 'none').  Only used when output_mode='x'.
         alpha_min: lower bound of the predicted split ratio (alpha in [alpha_min, 1]).
+        grad_checkpoint: trade ~20-30% extra compute for much lower activation
+                         memory (recommended for the 3-forward AF-PSM graph).
         """
         super().__init__()
         assert output_mode in ('uv', 'x'), f"unknown output_mode: {output_mode}"
@@ -190,6 +203,7 @@ class MFDiT(nn.Module):
         self.output_mode = output_mode
         self.output_activation = output_activation
         self.alpha_min = alpha_min
+        self.grad_checkpoint = grad_checkpoint
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, dim)
         self.t_embedder = TimestepEmbedder(dim)
@@ -326,8 +340,17 @@ class MFDiT(nn.Module):
             c = c + y                            # (N, D)
 
         h = x
-        for block in self.blocks:
-            h = block(h, c, use_flash_attention=use_flash_attention)
+        if self.grad_checkpoint and self.training:
+            # recompute block activations in backward -> much smaller training
+            # graph, which matters because AF-PSM runs three forward passes
+            for block in self.blocks:
+                h = checkpoint(
+                    partial(block, use_flash_attention=use_flash_attention),
+                    h, c, use_reentrant=False,
+                )
+        else:
+            for block in self.blocks:
+                h = block(h, c, use_flash_attention=use_flash_attention)
 
         if self.output_mode == 'uv':
             u = self.unpatchify(self.final_layer_u(h, c))

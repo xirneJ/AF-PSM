@@ -13,19 +13,40 @@ import os
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Windows / Linux / macOS candidates; the first existing file wins
+FONT_CANDIDATES = [
+    'C:/Windows/Fonts/arial.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+    '/usr/share/fonts/TTF/DejaVuSans.ttf',
+    '/System/Library/Fonts/Supplemental/Arial.ttf',
+]
+
+
+def load_font(size, preferred=None):
+    """Load a usable TrueType font across platforms (falls back to PIL default)."""
+    paths = ([preferred] if preferred else []) + FONT_CANDIDATES
+    for path in paths:
+        if path and os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    try:
+        return ImageFont.load_default(size=size)   # Pillow >= 10.1
+    except TypeError:
+        return ImageFont.load_default()
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=str, default='fakedigits')
     parser.add_argument('--n_per_class', type=int, default=8)
     parser.add_argument('--image_size', type=int, default=32)
-    parser.add_argument('--font', type=str, default='C:/Windows/Fonts/arial.ttf')
+    parser.add_argument('--font', type=str, default=None, help='optional .ttf path')
     args = parser.parse_args()
 
-    try:
-        font = ImageFont.truetype(args.font, size=int(args.image_size * 0.9))
-    except OSError:
-        font = ImageFont.load_default()
+    font = load_font(int(args.image_size * 0.9), args.font)
 
     for label in range(10):
         out_dir = os.path.join(args.root, str(label))

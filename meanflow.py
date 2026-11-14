@@ -288,6 +288,7 @@ class AFPSM:
         freq_loss='rel_hp',
         freq_gamma=1.0,
         fft_dtype=torch.float32,
+        use_flash_attention=False,
     ):
         self.channels = channels
         self.image_size = image_size
@@ -308,6 +309,9 @@ class AFPSM:
         self.freq_loss = freq_loss
         self.freq_gamma = freq_gamma
         self.fft_dtype = fft_dtype
+        # memory-efficient attention (SDPA) instead of the O(T^2) naive path;
+        # no JVP in AF-PSM, so fused attention kernels are safe to use
+        self.use_flash_attention = use_flash_attention
 
     # ------------------------------------------------------------------ utils
     def sample_t_r(self, batch_size, device):
@@ -400,7 +404,8 @@ class AFPSM:
         v = e - x                                          # dz/dt
 
         # ---- forward 1: direct one-step prediction + adaptive split ratio ----
-        x_hat_p, alpha = model(z_t, t, r, y=c)
+        x_hat_p, alpha = model(z_t, t, r, y=c,
+                               use_flash_attention=self.use_flash_attention)
         alpha_det = alpha.detach()
         alpha4 = rearrange(alpha_det, "b -> b 1 1 1")       # (B, 1, 1, 1)
         # s = alpha * r + (1 - alpha) * t  is the dynamic intermediate point
@@ -409,14 +414,16 @@ class AFPSM:
         s4 = rearrange(s, "b -> b 1 1 1")
 
         # ---- forward 2: first leg, supervised onto the exact intermediate state
-        x_hat_s = model(z_t, t, s, y=c, return_alpha=False)
+        x_hat_s = model(z_t, t, s, y=c, return_alpha=False,
+                        use_flash_attention=self.use_flash_attention)
         t_safe = t4.clamp_min(1e-6)
         z_s_hat = (1 - s4 / t_safe) * x_hat_s + (s4 / t_safe) * z_t
         s_hat = z_s_hat                                     # (B, C, H, W) state at time s
 
         # ---- forward 3: second leg, starts from the predicted state ----
         z_s_in = s_hat.detach() if self.detach_xs else s_hat
-        x_hat_r = model(z_s_in, s, r, y=c, return_alpha=False)
+        x_hat_r = model(z_s_in, s, r, y=c, return_alpha=False,
+                        use_flash_attention=self.use_flash_attention)
 
         # ---- exact (detached) targets; sign: z_s = z_t + alpha * (r - t) * v ----
         z_s_true = (z_t + alpha4 * (r4 - t4) * v).detach()
@@ -479,14 +486,18 @@ class AFPSM:
             t = torch.full((n,), t_vals[i].item(), device=device)
             r = torch.full((n,), t_vals[i + 1].item(), device=device)
             if adaptive:
-                _, alpha = model(z, t, r, y=c)
+                _, alpha = model(z, t, r, y=c,
+                                 use_flash_attention=self.use_flash_attention)
                 s = alpha * r + (1 - alpha) * t
-                x_hat_s = model(z, t, s, y=c, return_alpha=False)
+                x_hat_s = model(z, t, s, y=c, return_alpha=False,
+                                use_flash_attention=self.use_flash_attention)
                 z = self._state_from_clean(x_hat_s, z, t, s)
-                x_hat_r = model(z, s, r, y=c, return_alpha=False)
+                x_hat_r = model(z, s, r, y=c, return_alpha=False,
+                                use_flash_attention=self.use_flash_attention)
                 z = self._state_from_clean(x_hat_r, z, s, r)
             else:
-                x_hat = model(z, t, r, y=c, return_alpha=False)
+                x_hat = model(z, t, r, y=c, return_alpha=False,
+                              use_flash_attention=self.use_flash_attention)
                 z = self._state_from_clean(x_hat, z, t, r)
 
         return self.normer.unnorm(z)
