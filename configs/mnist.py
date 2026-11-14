@@ -1,7 +1,7 @@
 config = dict(
     name="mnist",
     dataset="mnist",
-    data_root="mnist",
+    data_root="data/mnist",
     n_steps=200_000,
     batch_size=64,
     num_workers=8,

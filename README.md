@@ -62,6 +62,8 @@ Switches in the `meanflow` block: `alpha_curriculum` (`linear` = 1 -> 0.01, plus
 pip install torch accelerate torchvision einops tqdm diffusers
 ```
 
+Datasets live under `<repo root>/data/` (git-ignored): e.g. `data/mnist/MNIST/...`, `data/cifar/cifar-10-batches-py/...`, `data/imagenet/<class>/...`. Relative `data_root` paths are resolved against the repo root (not the current directory), so training can be launched from anywhere. Override the location with `--data_root` or the `AFPSM_DATA_ROOT` environment variable to move the dataset tree to another disk.
+
 ```bash
 # single GPU
 python train.py --config configs/mnist.py

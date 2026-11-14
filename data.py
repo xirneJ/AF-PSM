@@ -1,9 +1,33 @@
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 import torchvision
 from PIL import Image
 from torchvision import transforms as T
 from torchvision.datasets import ImageFolder
+
+# All datasets live under <repo root>/data by default, resolved against the
+# repository root (NOT the current working directory), so training can be
+# launched from anywhere:
+#     <repo root>/data/mnist/MNIST/...
+#     <repo root>/data/cifar/cifar-10-batches-py/...
+#     <repo root>/data/imagenet/<class>/...
+# Set AFPSM_DATA_ROOT to move the dataset tree to another disk; relative
+# data_root paths are then resolved under it instead of the repo root.
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+
+
+def resolve_data_root(cfg):
+    """Resolve a config data_root to an absolute path (repo-root anchored)."""
+    root = Path(cfg.get("data_root", "data"))
+    if root.is_absolute():
+        return root
+    env_root = os.environ.get("AFPSM_DATA_ROOT")
+    base = Path(env_root).expanduser().resolve() if env_root else PROJECT_ROOT
+    return (base / root).resolve()
 
 
 def center_crop_arr(pil_image, image_size):
@@ -24,17 +48,21 @@ def center_crop_arr(pil_image, image_size):
 
 
 def build_dataset(cfg):
+    root = resolve_data_root(cfg)
+
     if cfg["dataset"] == "cifar10":
+        root.mkdir(parents=True, exist_ok=True)
         return torchvision.datasets.CIFAR10(
-            root=cfg["data_root"],
+            root=str(root),
             train=True,
             download=True,
             transform=T.Compose([T.ToTensor(), T.RandomHorizontalFlip()]),
         )
 
     if cfg["dataset"] == "mnist":
+        root.mkdir(parents=True, exist_ok=True)
         return torchvision.datasets.MNIST(
-            root=cfg["data_root"],
+            root=str(root),
             train=True,
             download=True,
             transform=T.Compose([
@@ -50,7 +78,7 @@ def build_dataset(cfg):
             T.ToTensor(),
             T.Normalize(0.5, 0.5),
         ])
-        return ImageFolder(cfg["data_root"], transform=transform)
+        return ImageFolder(str(root), transform=transform)
 
     if cfg["dataset"] == "folder":
         # generic image folder: keeps raw [0, 1] pixels, so `normalizer=["minmax"]`
@@ -68,7 +96,7 @@ def build_dataset(cfg):
                 img.load()
             return img
 
-        return ImageFolder(cfg["data_root"], transform=transform,
+        return ImageFolder(str(root), transform=transform,
                            loader=_keep_mode_loader)
 
     raise ValueError(f"Unknown dataset: {cfg['dataset']}")

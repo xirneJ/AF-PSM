@@ -13,7 +13,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
-from data import build_dataset, cycle
+from data import build_dataset, cycle, resolve_data_root
 from meanflow import MeanFlow, AFPSM
 from models.dit import MFDiT
 
@@ -31,6 +31,9 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=int, default=None, choices=[0, 1],
                         help='1: gradient checkpointing in the DiT blocks')
     parser.add_argument('--sample_steps', type=int, default=None)
+    parser.add_argument('--data_root', type=str, default=None,
+                        help='dataset root (relative paths resolve against the repo root, '
+                             'e.g. data/mnist)')
     args = parser.parse_args()
 
     spec = importlib.util.spec_from_file_location('train_config', args.config)
@@ -48,6 +51,8 @@ if __name__ == '__main__':
         cfg['meanflow']['use_flash_attention'] = bool(args.flash)
     if args.ckpt is not None:
         cfg['model']['grad_checkpoint'] = bool(args.ckpt)
+    if args.data_root is not None:
+        cfg['data_root'] = args.data_root
 
     accelerator = Accelerator(
         mixed_precision=cfg.get('mixed_precision', 'bf16'),
@@ -57,6 +62,7 @@ if __name__ == '__main__':
         print(f"[override] batch_size={cfg['batch_size']} n_steps={cfg['n_steps']} "
               f"flash={cfg['meanflow'].get('use_flash_attention', False)} "
               f"grad_checkpoint={cfg['model'].get('grad_checkpoint', False)}")
+        print(f"[data] dataset={cfg['dataset']} root={resolve_data_root(cfg)}")
 
     train_dataloader = torch.utils.data.DataLoader(
         build_dataset(cfg),

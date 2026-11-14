@@ -36,6 +36,13 @@ logs/
 images/
 checkpoints/
 
+# datasets: everything lives under <repo root>/data (never commit data)
+data/
+# legacy dataset locations used before the data/ convention
+mnist/
+cifar/
+fakedigits/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

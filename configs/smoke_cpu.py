@@ -4,7 +4,7 @@
 config = dict(
     name="afpsm_smoke_cpu",
     dataset="folder",
-    data_root="fakedigits",
+    data_root="data/fakedigits",
     n_steps=200,
     batch_size=16,
     num_workers=0,

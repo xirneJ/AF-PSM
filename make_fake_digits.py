@@ -4,14 +4,19 @@ The MNIST mirrors are not always reachable; this produces a class-conditional
 32x32 digit dataset that lets `configs/smoke_cpu.py` exercise the full training
 loop (dataloader -> AF-PSM loss -> logging -> sampling -> checkpoint) offline.
 
+Data lives under <repo root>/data/ by default (same convention as build_dataset).
+
 Usage:
-    python make_fake_digits.py                # -> fakedigits/<0..9>/*.png
-    python make_fake_digits.py --root mydir   # custom output root
+    python make_fake_digits.py                # -> data/fakedigits/<0..9>/*.png
+    python make_fake_digits.py --root /tmp/fakedigits
 """
 import argparse
 import os
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 # Windows / Linux / macOS candidates; the first existing file wins
 FONT_CANDIDATES = [
@@ -40,17 +45,21 @@ def load_font(size, preferred=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='fakedigits')
+    parser.add_argument('--root', type=str, default='data/fakedigits')
     parser.add_argument('--n_per_class', type=int, default=8)
     parser.add_argument('--image_size', type=int, default=32)
     parser.add_argument('--font', type=str, default=None, help='optional .ttf path')
     args = parser.parse_args()
 
+    root = Path(args.root)
+    if not root.is_absolute():
+        # relative paths are anchored at the repository root (same as data.py)
+        root = (PROJECT_ROOT / root).resolve()
     font = load_font(int(args.image_size * 0.9), args.font)
 
     for label in range(10):
-        out_dir = os.path.join(args.root, str(label))
-        os.makedirs(out_dir, exist_ok=True)
+        out_dir = root / str(label)
+        out_dir.mkdir(parents=True, exist_ok=True)
         for i in range(args.n_per_class):
             img = Image.new('L', (args.image_size, args.image_size), color=255)
             draw = ImageDraw.Draw(img)
@@ -64,9 +73,9 @@ def main():
                 font=font,
                 anchor='mm',
             )
-            img.save(os.path.join(out_dir, f'img_{i:02d}.png'))
+            img.save(out_dir / f'img_{i:02d}.png')
 
-    print(f"wrote {args.root}/<0..9>/*.png "
+    print(f"wrote {root}/<0..9>/*.png "
           f"({10 * args.n_per_class} images, {args.image_size}x{args.image_size})")
 
 

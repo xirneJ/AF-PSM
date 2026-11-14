@@ -1,7 +1,7 @@
 config = dict(
     name="cifar10",
     dataset="cifar10",
-    data_root="cifar",
+    data_root="data/cifar",
     n_steps=200_000,
     batch_size=64,
     num_workers=8,

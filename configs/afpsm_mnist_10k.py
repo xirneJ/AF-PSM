@@ -9,7 +9,7 @@
 config = dict(
     name="afpsm_mnist_10k",
     dataset="mnist",
-    data_root="mnist",
+    data_root="data/mnist",
     n_steps=10_000,
     batch_size=16,
     num_workers=8,
