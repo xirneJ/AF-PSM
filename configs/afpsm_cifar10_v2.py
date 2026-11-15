@@ -51,6 +51,8 @@ config = dict(
         cfg_ratio=0.1,
         cfg_scale=[1.0, 7.5],
         cfg_scale_ratio=0.75,
+        # FID-optimal guidance scale found on MNIST (~2.0); re-sweep on CIFAR
+        sample_w=2.0,
         freq_weight=0.0,
         mid_weight=0.0,
         alpha_weight=0.0,

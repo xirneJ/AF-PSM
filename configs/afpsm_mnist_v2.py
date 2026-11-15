@@ -61,6 +61,10 @@ config = dict(
         cfg_ratio=0.1,
         cfg_scale=[1.0, 7.5],
         cfg_scale_ratio=0.75,
+        # empirically the FID-optimal guidance scale for 1-step sampling on MNIST
+        # is ~2.0 (sweep: w=1.0 -> 92.7, 1.5 -> 45.8, 1.75 -> 35.6, 2.0 -> 32.0,
+        # 2.5 -> 35.6, 3.0 -> 38.4, 4.25 -> 56.5, 6.0 -> 87.2)
+        sample_w=2.0,
         # retired v1 terms, kept as knobs for the ablation table
         freq_weight=0.0,
         mid_weight=0.0,
