@@ -89,6 +89,22 @@ logs now break the objective into `pixel / anchor / cons` (the retired `freq / m
 `smoke_test.py` checks the v2 objective, the endpoint coverage of the mixed time distribution, the
 CFG-distilled sampler, and the v2 config wiring on CPU.
 
+## Collecting paper results
+
+`collect_results.py` snapshots everything needed for a paper into one folder (default
+`data/paper_results/<timestamp>/`, which is git-ignored):
+
+```bash
+python collect_results.py                 # logs + FID + eval grids + console logs
+python collect_results.py --with-ckpts    # also copy the *.pt checkpoints (~235 MB each)
+```
+
+It copies every `logs/<run>/{train.log,config.py,images/}`, `fid_results.jsonl`, the
+top-level `eval_*` grids, the console logs from `--extra-dir` (default `~/afpsm_logs`,
+including the `[override]` lines that record CLI overrides), and real-data calibration
+files; then writes `MANIFEST.md` (run summary, deduplicated FID table with NFE, file
+inventory, git commit) and `fid_table.md`.
+
 ## FID evaluation
 
 `fid_eval.py` computes FID with a standard InceptionV3 detector (torchvision ImageNet weights, auto-downloaded on first use) and appends one JSONL row per (model, sampling mode), so models can be compared in one table.
