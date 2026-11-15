@@ -402,13 +402,19 @@ class AFPSM:
         return w
 
     def _sampling_w(self, batch_size, device):
-        """Guidance scale used at sampling time (one forward pass, no 2x NFE)."""
-        if self.sample_w_value is not None:
-            return torch.full((batch_size,), self.sample_w_value, device=device)
+        """Guidance scale used at sampling time (one forward pass, no 2x NFE).
+
+        Precedence: an explicitly fixed cfg_scale (e.g. ``fid_eval --cfg_scale 2.0``)
+        wins over the config default ``sample_w``, which in turn wins over the
+        midpoint of the training ``cfg_scale`` range.  ``--no_cfg`` disables the
+        guidance conditioning entirely, so sampling always uses w = 1.
+        """
         if not self.use_cfg_w:
             return torch.ones(batch_size, device=device)
         if self.cfg_w_fixed is not None:
             return torch.full((batch_size,), self.cfg_w_fixed, device=device)
+        if self.sample_w_value is not None:
+            return torch.full((batch_size,), self.sample_w_value, device=device)
         low, high = self.cfg_w_range
         return torch.full((batch_size,), (low + high) / 2.0, device=device)
 

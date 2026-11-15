@@ -266,6 +266,16 @@ def main():
     model_v2.eval()
     w_s = afpsm_v2._sampling_w(4, device)
     assert abs(w_s[0].item() - 4.25) < 1e-6, w_s
+    # regression: an explicitly fixed cfg_scale must beat the default sample_w,
+    # and --no_cfg must always sample with w = 1
+    afpsm_ws = AFPSM(channels=C, image_size=H, num_classes=10,
+                     normalizer=['minmax', None, None], time_dist=['uniform'],
+                     cfg_scale=3.0, sample_w=2.0)
+    assert abs(afpsm_ws._sampling_w(2, device)[0].item() - 3.0) < 1e-6
+    afpsm_ws_off = AFPSM(channels=C, image_size=H, num_classes=10,
+                         normalizer=['minmax', None, None], time_dist=['uniform'],
+                         cfg_scale=None, sample_w=2.0)
+    assert abs(afpsm_ws_off._sampling_w(2, device)[0].item() - 1.0) < 1e-6
     imgs_v2 = afpsm_v2.sample_each_class(
         model_v2, n_per_class=1, classes=[0, 1], sample_steps=1, device=device,
     )
