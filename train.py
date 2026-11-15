@@ -48,6 +48,15 @@ if __name__ == '__main__':
     parser.add_argument('--alpha_weight', type=float, default=None)
     parser.add_argument('--freq_weight', type=float, default=None)
     parser.add_argument('--mid_weight', type=float, default=None)
+    parser.add_argument('--pixel_weight', type=float, default=None,
+                        help='AF-PSM v2: weight of MSE(direct, target)')
+    parser.add_argument('--anchor_weight', type=float, default=None,
+                        help='AF-PSM v2: weight of MSE(composed, target)')
+    parser.add_argument('--cons_weight', type=float, default=None,
+                        help='AF-PSM v2: weight of MSE(direct, stopgrad(composed))')
+    parser.add_argument('--alpha_mode', type=str, default=None,
+                        choices=['predicted', 'random'],
+                        help="AF-PSM v2: 'predicted' (v1 curriculum) or 'random'")
     parser.add_argument('--warmup_steps', type=int, default=None,
                         help='override scheduler warmup (match schedules across models)')
     parser.add_argument('--no_cfg', action='store_true',
@@ -93,6 +102,14 @@ if __name__ == '__main__':
         cfg['meanflow']['freq_weight'] = args.freq_weight
     if args.mid_weight is not None:
         cfg['meanflow']['mid_weight'] = args.mid_weight
+    if args.pixel_weight is not None:
+        cfg['meanflow']['pixel_weight'] = args.pixel_weight
+    if args.anchor_weight is not None:
+        cfg['meanflow']['anchor_weight'] = args.anchor_weight
+    if args.cons_weight is not None:
+        cfg['meanflow']['cons_weight'] = args.cons_weight
+    if args.alpha_mode is not None:
+        cfg['meanflow']['alpha_mode'] = args.alpha_mode
     if args.warmup_steps is not None:
         if cfg.get('scheduler') is None:
             cfg['scheduler'] = {}
@@ -118,7 +135,11 @@ if __name__ == '__main__':
               f"flash={cfg['meanflow'].get('use_flash_attention', False)} "
               f"grad_checkpoint={cfg['model'].get('grad_checkpoint', False)} "
               f"output_activation={cfg['model'].get('output_activation', 'tanh')} "
-              f"alpha_curriculum={cfg['meanflow'].get('alpha_curriculum', 'linear')} "
+              f"alpha_mode={cfg['meanflow'].get('alpha_mode', 'predicted')} "
+              f"weights(pixel/anchor/cons)={cfg['meanflow'].get('pixel_weight', 1.0)}/"
+              f"{cfg['meanflow'].get('anchor_weight', 1.0)}/"
+              f"{cfg['meanflow'].get('cons_weight', 0.0)} "
+              f"cfg_scale={cfg['meanflow'].get('cfg_scale')} "
               f"warmup={cfg.get('scheduler', {}).get('warmup_steps', 0)} "
               f"precision={cfg.get('mixed_precision', 'bf16')}")
         print(f"[data] dataset={cfg['dataset']} root={resolve_data_root(cfg)}")
@@ -278,7 +299,7 @@ if __name__ == '__main__':
 
         if accelerator.is_main_process:
             post = dict(Loss=f"{loss.item():.4f}")
-            for k in ('pixel', 'freq', 'mid'):
+            for k in ('pixel', 'anchor', 'cons', 'freq', 'mid'):
                 if k in mse_val:
                     post[k.capitalize()] = f"{mse_val[k].item():.4f}"
             if 'alpha_pred' in mse_val:

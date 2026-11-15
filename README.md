@@ -54,6 +54,41 @@ python train.py --config configs/afpsm_mnist_10k.py --batch_size 16 --flash 1 --
 
 Switches in the `meanflow` block: `alpha_curriculum` (`linear` = 1 -> 0.01, plus `to_half`, `triangular`, `const`, `none`), `freq_loss` (`rel_hp` = ortho rfft2 with soft high-pass weighting and energy normalization, or the literal `mse`), `alpha_weight` / `freq_weight` / `mid_weight`, `alpha_stopgrad`, `detach_xs`, `use_flash_attention` (memory-efficient SDPA; safe now that there is no JVP). `model.grad_checkpoint=True` trades ~20-30% compute for much lower activation memory.
 
+### AF-PSM v2: consistency distillation + CFG (current research line)
+
+The v1 objective is effectively a plain x0-denoiser trained twice: both branches regress the same
+conditional mean `E[x | z_t]`, so 1-step sampling collapses to the class mean, and the
+`mid` / `freq` / `alpha` terms die out (`L_mid` is identically `(alpha(t-r)/t)^2 * MSE(x_s, x)`
+and becomes vacuous as `alpha -> 0`; `L_freq` drops to ~1e-4). Measured on MNIST at 960k samples:
+1-step FID **119** vs 2-step **23.5** — the direct path is the weak one.
+
+`configs/afpsm_mnist_v2.py` / `configs/afpsm_cifar10_v2.py` implement the fix:
+
+| change | what it does |
+|---|---|
+| **M1 consistency distillation** | `pixel_weight=0, anchor_weight=1, cons_weight=1`: only the two-leg composition is anchored to data; the direct 1-step prediction is distilled from it with `stopgrad(x_r)`. The composition's input state carries the noise realization, so it is far better identified than the direct path. |
+| **M2 mixed time sampling** | `time_dist=["mixed", mu, sigma, p_uniform]` (default 50% uniform): the inference endpoints `t=1, r=0` were essentially never visited by the logit-normal (`P(t>0.99) ~ 6e-7`). |
+| **M3 CFG distillation** | `cfg_ratio / cfg_scale / cfg_scale_ratio` mirror the iMF baseline: `w` is a model input and the guided target is built from no-grad conditional/unconditional predictions, so guidance is free at sampling (no doubled NFE). In x-space this is `x_cfg = x + (1 - 1/w)(x_c - x_uc)`. |
+| **M4 honest split** | `alpha_mode="random"`: every `s in (r, t)` is an equally valid training interval, so an alpha curriculum has no signal source. Random split in training, uniform grid at sampling; the vacuous `freq/mid` terms are off. |
+
+```bash
+# quick check (~2-2.5 h on a shared 5090: 3 grad forwards + 2 no-grad CFG forwards)
+python train.py --config configs/afpsm_mnist_v2.py --n_steps 10000 --flash 1 --ckpt 1
+# official 30k run (960k samples, matches the iMF baseline budget; ~6.5-7.5 h)
+python train.py --config configs/afpsm_mnist_v2.py --n_steps 30000 --flash 1 --ckpt 1
+# CIFAR-10
+python train.py --config configs/afpsm_cifar10_v2.py --n_steps 30000 --flash 1 --ckpt 1
+# ablate one knob: no consistency distillation (back to v1-style double anchoring)
+python train.py --config configs/afpsm_mnist_v2.py --cons_weight 0 --pixel_weight 1
+# ablate CFG
+python train.py --config configs/afpsm_mnist_v2.py --no_cfg
+```
+
+`--no_cfg` sets `cfg_scale=None`, which disables CFG distillation and guided sampling. Training
+logs now break the objective into `pixel / anchor / cons` (the retired `freq / mid` remain knobs).
+`smoke_test.py` checks the v2 objective, the endpoint coverage of the mixed time distribution, the
+CFG-distilled sampler, and the v2 config wiring on CPU.
+
 ## FID evaluation
 
 `fid_eval.py` computes FID with a standard InceptionV3 detector (torchvision ImageNet weights, auto-downloaded on first use) and appends one JSONL row per (model, sampling mode), so models can be compared in one table.

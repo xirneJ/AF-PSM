@@ -340,9 +340,10 @@ class MFDiT(nn.Module):
             c = c + y                            # (N, D)
 
         h = x
-        if self.grad_checkpoint and self.training:
+        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
             # recompute block activations in backward -> much smaller training
-            # graph, which matters because AF-PSM runs three forward passes
+            # graph, which matters because AF-PSM runs three forward passes.
+            # (skipped under torch.no_grad(), e.g. the CFG distillation forwards)
             for block in self.blocks:
                 h = checkpoint(
                     partial(block, use_flash_attention=use_flash_attention),

@@ -7,6 +7,12 @@ Checks:
   4) frequency loss variants ('rel_hp', 'mse'): scalar, finite
   5) x-pred sampler: 1-step / 2-step / 2-step adaptive
   6) baseline regression: MFDiT(output_mode='uv') + JVP MeanFlow.loss still runs
+  7) real config wiring (v1)
+  8) grad checkpoint / SDPA plumbing
+  9) v2 objective: composition anchor + stopgrad consistency + CFG distillation
+ 10) v2 mixed time distribution actually covers the inference endpoints
+ 11) v2 CFG-distilled sampler (w as input, single forward pass)
+ 12) v2 config wiring (configs/afpsm_mnist_v2.py)
 
 Run:  .venv\\Scripts\\python.exe smoke_test.py   (cwd = MeanFlow)
 """
@@ -215,6 +221,82 @@ def main():
     assert torch.isfinite(imgs_sdpa).all()
     print(f"[8b] use_flash_attention plumbing ok | loss {total_sdpa.item():.4f} | "
           f"sampler ok")
+
+    # ---------------- 9) AF-PSM v2 objective (M1 + M2 + M3 + M4) ----------
+    afpsm_v2 = AFPSM(
+        channels=C, image_size=H, num_classes=10,
+        normalizer=['minmax', None, None],
+        time_dist=['mixed', -0.4, 1.0, 0.5],
+        alpha_mode='random', split_min=0.1,
+        pixel_weight=0.0, anchor_weight=1.0, cons_weight=1.0,
+        cfg_ratio=0.1, cfg_scale=[1.0, 7.5], cfg_scale_ratio=0.75,
+        freq_weight=0.0, mid_weight=0.0, alpha_weight=0.0,
+    )
+    model_v2 = build_model(C, H)
+    model_v2.train()
+    total_v2, stats_v2 = afpsm_v2.loss(model_v2, x, c, step=0, total_steps=1000)
+    assert torch.isfinite(total_v2), total_v2
+    for k in ('pixel', 'anchor', 'cons', 'freq', 'mid', 'alpha', 'alpha_pred'):
+        assert k in stats_v2 and torch.isfinite(stats_v2[k]), k
+    assert stats_v2['anchor'].item() > 0
+    assert stats_v2['pixel'].item() == 0 and stats_v2['mid'].item() == 0
+    total_v2.backward()
+    # only the (intentionally unused) alpha head may have no gradient
+    no_grad_v2 = [n for n, p in model_v2.named_parameters()
+                  if p.requires_grad and p.grad is None and not n.startswith('alpha_')]
+    assert not no_grad_v2, no_grad_v2[:5]
+    print(f"[9] v2 objective ok | total {total_v2.item():.4f} | "
+          f"anchor={stats_v2['anchor'].item():.4f} "
+          f"cons={stats_v2['cons'].item():.4f} | alpha_mode=random")
+
+    # ---------------- 10) mixed time dist covers the endpoints -------------
+    ts, rs = [], []
+    for _ in range(100):
+        tt, rr = afpsm_v2.sample_t_r(256, device)
+        ts.append(tt)
+        rs.append(rr)
+    ts, rs = torch.cat(ts), torch.cat(rs)
+    assert (ts > rs).all()
+    assert ts.max() > 0.99 and rs.min() < 0.01, (ts.max().item(), rs.min().item())
+    print(f"[10] mixed time_dist ok | max t={ts.max():.4f} min r={rs.min():.4f} "
+          f"frac(t>0.99)={(ts > 0.99).float().mean():.4f} "
+          f"frac(r<0.01)={(rs < 0.01).float().mean():.4f}")
+
+    # ---------------- 11) CFG-distilled sampler (w input, 1 NFE) ----------
+    model_v2.eval()
+    w_s = afpsm_v2._sampling_w(4, device)
+    assert abs(w_s[0].item() - 4.25) < 1e-6, w_s
+    imgs_v2 = afpsm_v2.sample_each_class(
+        model_v2, n_per_class=1, classes=[0, 1], sample_steps=1, device=device,
+    )
+    assert torch.isfinite(imgs_v2).all()
+    assert imgs_v2.min() >= -1e-6 and imgs_v2.max() <= 1 + 1e-6
+    print(f"[11] CFG sampler ok | sampling w=4.25 (cfg_scale midpoint) | "
+          f"1-step range=[{imgs_v2.min():.3f}, {imgs_v2.max():.3f}]")
+
+    # ---------------- 12) v2 config wiring (same path as train.py) --------
+    cfg_v2_path = Path(__file__).resolve().parent / 'configs' / 'afpsm_mnist_v2.py'
+    spec_v2 = importlib.util.spec_from_file_location('cfg_afpsm_mnist_v2', cfg_v2_path)
+    cfg_v2_mod = importlib.util.module_from_spec(spec_v2)
+    spec_v2.loader.exec_module(cfg_v2_mod)
+    cfg_v2 = cfg_v2_mod.config
+    model_real2 = MFDiT(**cfg_v2['model'])
+    mf_cfg2 = dict(cfg_v2['meanflow'])
+    mode2 = mf_cfg2.pop('mode')
+    mf_cfg2['channels'] = cfg_v2['model']['in_channels']
+    mf_cfg2['image_size'] = cfg_v2['model']['input_size']
+    mf_cfg2['num_classes'] = cfg_v2['model']['num_classes']
+    valid2 = inspect.signature(AFPSM).parameters
+    afpsm_real2 = AFPSM(**{k: v for k, v in mf_cfg2.items() if k in valid2})
+    loss_real2, stats_real2 = afpsm_real2.loss(
+        model_real2, x_real, c_real, step=100, total_steps=cfg_v2['n_steps'])
+    loss_real2.backward()
+    assert torch.isfinite(loss_real2)
+    n_params2 = sum(p.numel() for p in model_real2.parameters())
+    print(f"[12] v2 config wiring ok | mode={mode2} | {n_params2 / 1e6:.2f}M params | "
+          f"loss={loss_real2.item():.4f} | anchor={stats_real2['anchor'].item():.4f} "
+          f"cons={stats_real2['cons'].item():.4f} | "
+          f"alpha_mode={afpsm_real2.alpha_mode} | cfg_scale={afpsm_real2.cfg_w_range}")
 
     print("\nALL SMOKE TESTS PASSED")
 

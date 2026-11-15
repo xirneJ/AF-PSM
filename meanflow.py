@@ -289,6 +289,19 @@ class AFPSM:
         freq_gamma=1.0,
         fft_dtype=torch.float32,
         use_flash_attention=False,
+        # ------------------------------------------------------------------
+        # AF-PSM v2 knobs.  The defaults reproduce the v1 objective exactly,
+        # so existing configs keep working unchanged.
+        # ------------------------------------------------------------------
+        alpha_mode='predicted',
+        split_min=0.1,
+        pixel_weight=1.0,
+        anchor_weight=1.0,
+        cons_weight=0.0,
+        cfg_ratio=0.0,
+        cfg_scale=None,
+        cfg_scale_ratio=0.75,
+        sample_w=None,
     ):
         self.channels = channels
         self.image_size = image_size
@@ -313,6 +326,40 @@ class AFPSM:
         # no JVP in AF-PSM, so fused attention kernels are safe to use
         self.use_flash_attention = use_flash_attention
 
+        # ---- v2: how the split point s is chosen --------------------------
+        # 'predicted' = alpha head + curriculum (v1)
+        # 'random'    = s between r and t with a random fraction (every split is
+        #               an equally valid training interval, so a curriculum has no
+        #               signal source -- see the v1 analysis)
+        assert alpha_mode in ('predicted', 'random')
+        self.alpha_mode = alpha_mode
+        self.split_min = float(split_min)
+        # ---- v2: which branch is anchored to the target and which is distilled
+        # v1 used pixel_weight=anchor_weight=1, cons_weight=0 (both branches -> x).
+        # v2 uses pixel_weight=0, anchor_weight=1, cons_weight=1: only the composed
+        # path is anchored to data; the direct path distils it (M1).
+        self.pixel_weight = pixel_weight
+        self.anchor_weight = anchor_weight
+        self.cons_weight = cons_weight
+        # ---- v2: CFG distillation, same recipe as the iMF baseline ---------
+        # w is a model input; the guided target is built from no-grad conditional
+        # / unconditional predictions, so sampling needs only one forward pass.
+        self.cfg_ratio = float(cfg_ratio)
+        self.cfg_scale_ratio = float(cfg_scale_ratio)
+        self.use_cfg_w = cfg_scale is not None
+        if self.use_cfg_w and isinstance(cfg_scale, (int, float)):
+            self.cfg_w_fixed = float(cfg_scale)
+            self.cfg_w_range = None
+        elif self.use_cfg_w:
+            self.cfg_w_fixed = None
+            self.cfg_w_range = (float(cfg_scale[0]), float(cfg_scale[1]))
+        else:
+            self.cfg_w_fixed = None
+            self.cfg_w_range = None
+        # explicit sampling-time guidance scale (None -> midpoint of cfg_scale,
+        # mirroring MeanFlow.sample_each_class)
+        self.sample_w_value = None if sample_w is None else float(sample_w)
+
     # ------------------------------------------------------------------ utils
     def sample_t_r(self, batch_size, device):
         """Sample interval endpoints with t > r (integration towards the data end)."""
@@ -322,12 +369,48 @@ class AFPSM:
             mu, sigma = self.time_dist[-2], self.time_dist[-1]
             normal_samples = np.random.randn(batch_size, 2).astype(np.float32) * sigma + mu
             samples = 1 / (1 + np.exp(-normal_samples))
+        elif self.time_dist[0] == 'mixed':
+            # ['mixed', mu, sigma, p_uniform]: elementwise mix of logit-normal and
+            # uniform.  The uniform part is what puts mass on the *inference*
+            # endpoints (t ~ 1, r ~ 0), which the logit-normal almost never visits
+            # (P(t > 0.99) ~ 6e-7 for the default mu=-0.4, sigma=1.0).
+            mu, sigma, p_uniform = self.time_dist[-3], self.time_dist[-2], self.time_dist[-1]
+            normal_samples = np.random.randn(batch_size, 2).astype(np.float32) * sigma + mu
+            lognorm = 1.0 / (1.0 + np.exp(-normal_samples))
+            uniform = np.random.rand(batch_size, 2).astype(np.float32)
+            pick_uniform = np.random.rand(batch_size, 2) < float(p_uniform)
+            samples = np.where(pick_uniform, uniform, lognorm).astype(np.float32)
         else:
             raise ValueError(f"Unknown time_dist: {self.time_dist[0]}")
 
         t = torch.tensor(np.maximum(samples[:, 0], samples[:, 1]), device=device)
         r = torch.tensor(np.minimum(samples[:, 0], samples[:, 1]), device=device)
         return t, r
+
+    def _sample_w_batch(self, batch_size, device):
+        """Training-time guidance scales (same distribution as the iMF baseline)."""
+        if not self.use_cfg_w:
+            return torch.ones(batch_size, device=device)
+        if self.cfg_w_fixed is not None:
+            return torch.full((batch_size,), self.cfg_w_fixed, device=device)
+        low, high = self.cfg_w_range
+        w = torch.ones(batch_size, device=device)
+        num = int(self.cfg_scale_ratio * batch_size)
+        if num > 0:
+            idx = torch.randperm(batch_size, device=device)[:num]
+            w[idx] = torch.empty(num, device=device).uniform_(low, high)
+        return w
+
+    def _sampling_w(self, batch_size, device):
+        """Guidance scale used at sampling time (one forward pass, no 2x NFE)."""
+        if self.sample_w_value is not None:
+            return torch.full((batch_size,), self.sample_w_value, device=device)
+        if not self.use_cfg_w:
+            return torch.ones(batch_size, device=device)
+        if self.cfg_w_fixed is not None:
+            return torch.full((batch_size,), self.cfg_w_fixed, device=device)
+        low, high = self.cfg_w_range
+        return torch.full((batch_size,), (low + high) / 2.0, device=device)
 
     @staticmethod
     def _state_from_clean(x_hat, z_t, t, u):
@@ -384,9 +467,18 @@ class AFPSM:
     def loss(self, model, x, c=None, step=0, total_steps=None):
         """
         AF-PSM training loss (no JVP).
+
+        v1 defaults reproduce the original objective:
+            L = MSE(x_p, x) + MSE(x_r, x) + freq/mid/alpha terms
+        v2 (see configs/afpsm_*_v2.py) uses the consistency formulation:
+            L = anchor_weight * MSE(x_r, T) + cons_weight * MSE(x_p, sg(x_r))
+        where x_r is the two-leg composition (anchored to the data-side target T)
+        and x_p is the direct prediction that distils it (M1); T is the CFG-guided
+        target when CFG distillation is enabled (M3).
+
         x: (B, C, H, W) images in [0, 1] (normalized inside)
         c: (B,) class labels (optional)
-        step/total_steps: training progress, used by the alpha curriculum
+        step/total_steps: training progress, only used by the v1 alpha curriculum
         returns (total_loss, stats_dict)
         """
         if getattr(model, 'output_mode', 'uv') != 'x':
@@ -403,61 +495,103 @@ class AFPSM:
         z_t = (1 - t4) * x + t4 * e                        # (B, C, H, W)
         v = e - x                                          # dz/dt
 
-        # ---- forward 1: direct one-step prediction + adaptive split ratio ----
-        x_hat_p, alpha = model(z_t, t, r, y=c,
-                               use_flash_attention=self.use_flash_attention)
-        alpha_det = alpha.detach()
-        alpha4 = rearrange(alpha_det, "b -> b 1 1 1")       # (B, 1, 1, 1)
-        # s = alpha * r + (1 - alpha) * t  is the dynamic intermediate point
-        alpha_used = alpha if not self.alpha_stopgrad else alpha_det
-        s = alpha_used * r + (1 - alpha_used) * t
+        # ---- conditioning: label dropout + CFG scale (M3) ------------------
+        # Mirrors the iMF baseline: w is a model input and the guided target is
+        # built from no-grad conditional / unconditional predictions, so sampling
+        # stays at a single forward pass (no doubled NFE).
+        if c is not None and self.use_cfg_w:
+            uncond = torch.full_like(c, self.num_classes)
+            w = self._sample_w_batch(batch_size, device)
+            drop = torch.rand(batch_size, device=device) < self.cfg_ratio
+            c_cond = torch.where(drop, uncond, c)
+            w_cond = torch.where(drop, torch.ones_like(w), w)
+            with torch.no_grad():
+                x_c = model(z_t, t, r, y=c_cond, w=w_cond, return_alpha=False,
+                            use_flash_attention=self.use_flash_attention)
+                x_uc = model(z_t, t, r, y=uncond, w=torch.ones_like(w),
+                             return_alpha=False,
+                             use_flash_attention=self.use_flash_attention)
+            # x-space equivalent of iMF's v_hat = v + (1 - 1/w) * (v_c - v_uc)
+            w4 = rearrange(w_cond, "b -> b 1 1 1")
+            target = (x + (1.0 - 1.0 / w4) * (x_c - x_uc)).detach()
+        else:
+            c_cond, w_cond = c, None
+            target = x.detach()
+
+        # ---- forward 1: direct prediction (student) + split ratio ----------
+        if self.alpha_mode == 'predicted':
+            x_hat_p, alpha = model(z_t, t, r, y=c_cond, w=w_cond,
+                                   use_flash_attention=self.use_flash_attention)
+            alpha_det = alpha.detach()
+            alpha_used = alpha if not self.alpha_stopgrad else alpha_det
+            s = alpha_used * r + (1 - alpha_used) * t
+        else:
+            x_hat_p = model(z_t, t, r, y=c_cond, w=w_cond, return_alpha=False,
+                            use_flash_attention=self.use_flash_attention)
+            alpha = None
+            # random split: every s in (r, t) is an equally valid interval, so a
+            # learned head / curriculum has no signal source here (M4)
+            alpha_det = self.split_min + (1.0 - 2.0 * self.split_min) * torch.rand(
+                batch_size, device=device)
+            s = alpha_det * r + (1.0 - alpha_det) * t
+        alpha4 = rearrange(alpha_det, "b -> b 1 1 1")
         s4 = rearrange(s, "b -> b 1 1 1")
 
-        # ---- forward 2: first leg, supervised onto the exact intermediate state
-        x_hat_s = model(z_t, t, s, y=c, return_alpha=False,
+        # ---- forward 2: first leg -----------------------------------------
+        x_hat_s = model(z_t, t, s, y=c_cond, w=w_cond, return_alpha=False,
                         use_flash_attention=self.use_flash_attention)
         t_safe = t4.clamp_min(1e-6)
         z_s_hat = (1 - s4 / t_safe) * x_hat_s + (s4 / t_safe) * z_t
-        s_hat = z_s_hat                                     # (B, C, H, W) state at time s
+        s_hat = z_s_hat                                     # state at time s
 
-        # ---- forward 3: second leg, starts from the predicted state ----
+        # ---- forward 3: second leg (the composition / teacher) ------------
         z_s_in = s_hat.detach() if self.detach_xs else s_hat
-        x_hat_r = model(z_s_in, s, r, y=c, return_alpha=False,
+        x_hat_r = model(z_s_in, s, r, y=c_cond, w=w_cond, return_alpha=False,
                         use_flash_attention=self.use_flash_attention)
 
-        # ---- exact (detached) targets; sign: z_s = z_t + alpha * (r - t) * v ----
-        z_s_true = (z_t + alpha4 * (r4 - t4) * v).detach()
+        zero = torch.zeros((), device=device, dtype=x_hat_p.dtype)
 
-        # ---- 1) pixel anchoring ----
-        l_pixel = F.mse_loss(x_hat_p, x) + F.mse_loss(x_hat_r, x)
-
-        # ---- 2) frequency consistency (high-frequency edges of the two clean preds) ----
-        l_freq = self.freq_consistency(x_hat_p, x_hat_r)
-
-        # ---- 3) exact midpoint supervision ----
-        l_mid = F.mse_loss(s_hat, z_s_true)
-
-        # ---- 4) alpha curriculum regularization ----
-        alpha_target = self._alpha_target(step, total_steps)
-        if alpha_target is None:
-            l_alpha = torch.zeros((), device=device, dtype=l_pixel.dtype)
-        else:
+        # ---- 1) direct pixel anchoring (v1 only; v2 sets pixel_weight=0) ---
+        l_pixel = F.mse_loss(x_hat_p, target) if self.pixel_weight > 0 else zero
+        # ---- 2) composed-path anchoring (the data-side objective) ---------
+        l_anchor = F.mse_loss(x_hat_r, target) if self.anchor_weight > 0 else zero
+        # ---- 3) consistency distillation: direct <- composed (v2 core, M1) -
+        l_cons = (F.mse_loss(x_hat_p, x_hat_r.detach())
+                  if self.cons_weight > 0 else zero)
+        # ---- 4) retired v1 terms (kept for ablations) ----------------------
+        l_freq = (self.freq_consistency(x_hat_p, x_hat_r)
+                  if self.freq_weight > 0 else zero)
+        l_mid = zero
+        if self.mid_weight > 0:
+            z_s_true = (z_t + alpha4 * (r4 - t4) * v).detach()
+            l_mid = F.mse_loss(s_hat, z_s_true)
+        alpha_target = (self._alpha_target(step, total_steps)
+                        if self.alpha_mode == 'predicted' else None)
+        l_alpha = zero
+        if (self.alpha_mode == 'predicted' and self.alpha_weight > 0
+                and alpha_target is not None):
             l_alpha = F.mse_loss(alpha, torch.full_like(alpha, float(alpha_target)))
 
         total = (
-            l_pixel
+            self.pixel_weight * l_pixel
+            + self.anchor_weight * l_anchor
+            + self.cons_weight * l_cons
             + self.freq_weight * l_freq
             + self.mid_weight * l_mid
             + self.alpha_weight * l_alpha
         )
 
+        alpha_pred = alpha.detach().mean() if alpha is not None else alpha_det.mean()
         stats = {
             'pixel': l_pixel.detach(),
+            'anchor': l_anchor.detach(),
+            'cons': l_cons.detach(),
             'freq': l_freq.detach(),
             'mid': l_mid.detach(),
             'alpha': l_alpha.detach(),
-            'alpha_pred': alpha.detach().mean(),
-            'alpha_target': torch.tensor(float(alpha_target) if alpha_target is not None else -1.0),
+            'alpha_pred': alpha_pred,
+            'alpha_target': torch.tensor(
+                float(alpha_target) if alpha_target is not None else -1.0),
         }
         return total, stats
 
@@ -467,9 +601,14 @@ class AFPSM:
                           sample_steps=1, device='cuda', adaptive=False):
         """
         x-prediction sampler.
-        1 step: x_hat = model(z, 1, 0) is the final image directly.
-        K steps: z_{r} = (1 - r/t) * x_hat + (r/t) * z_t   (closed-form state update).
-        adaptive=True additionally splits every interval at the predicted alpha.
+
+        1 step: x_hat = model(z, 1, 0, w) is the final image directly.
+        K steps: z_r = (1 - r/t) * x_hat + (r/t) * z_t  (closed-form state update).
+        adaptive=True additionally splits every interval; it carries information
+        only when the alpha head was trained (alpha_mode='predicted'), otherwise
+        a fixed 0.5 split is used.
+
+        w is a model input (CFG distillation), so guidance costs no extra NFE.
         """
         model.eval()
 
@@ -480,23 +619,27 @@ class AFPSM:
 
         n = c.shape[0]
         z = torch.randn(n, self.channels, self.image_size, self.image_size, device=device)
+        w = self._sampling_w(n, device)
         t_vals = torch.linspace(1.0, 0.0, sample_steps + 1, device=device)
 
         for i in range(sample_steps):
             t = torch.full((n,), t_vals[i].item(), device=device)
             r = torch.full((n,), t_vals[i + 1].item(), device=device)
             if adaptive:
-                _, alpha = model(z, t, r, y=c,
-                                 use_flash_attention=self.use_flash_attention)
+                if self.alpha_mode == 'predicted':
+                    _, alpha = model(z, t, r, y=c, w=w,
+                                     use_flash_attention=self.use_flash_attention)
+                else:
+                    alpha = torch.full((n,), 0.5, device=device)
                 s = alpha * r + (1 - alpha) * t
-                x_hat_s = model(z, t, s, y=c, return_alpha=False,
+                x_hat_s = model(z, t, s, y=c, w=w, return_alpha=False,
                                 use_flash_attention=self.use_flash_attention)
                 z = self._state_from_clean(x_hat_s, z, t, s)
-                x_hat_r = model(z, s, r, y=c, return_alpha=False,
+                x_hat_r = model(z, s, r, y=c, w=w, return_alpha=False,
                                 use_flash_attention=self.use_flash_attention)
                 z = self._state_from_clean(x_hat_r, z, s, r)
             else:
-                x_hat = model(z, t, r, y=c, return_alpha=False,
+                x_hat = model(z, t, r, y=c, w=w, return_alpha=False,
                               use_flash_attention=self.use_flash_attention)
                 z = self._state_from_clean(x_hat, z, t, r)
 
