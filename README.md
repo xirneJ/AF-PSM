@@ -89,6 +89,21 @@ logs now break the objective into `pixel / anchor / cons` (the retired `freq / m
 `smoke_test.py` checks the v2 objective, the endpoint coverage of the mixed time distribution, the
 CFG-distilled sampler, and the v2 config wiring on CPU.
 
+### Long-training diversity collapse (important)
+
+With the full training guidance range `cfg_scale=[1.0, 7.5]`, MNIST FID improves until ~10k steps
+and then **degrades**: 1-step FID 32.0 @10k -> 44.7 @15k -> 52.3 @20k -> 68.5 @30k, while the
+training losses keep falling. Checkpoint diagnostics show the mechanism: class accuracy stays
+~99-100% and output magnitudes are stable, but **within-class diversity collapses**
+(0.128 @10k -> 0.087 @30k) — the self-referential CFG target
+`T = x + (1 - 1/w)(x_c - x_uc)` progressively drives every sample of a class toward one
+stereotyped shape. The training range (up to w = 7.5, amplification `1/(1-1/w)` = 7.5x) is far
+wider than the FID-optimal sampling scale (~2.0), so the loop gain is much larger than needed.
+
+Mitigation: narrow the training guidance range, e.g. `--cfg_scale 1,3` (amplification <= 1.5x);
+this is what long `afpsm_*_v2.py` runs should use. Related knobs: `--cfg_scale_ratio` (fraction of
+the batch trained with guided targets) and `--cfg_ratio` (label dropout probability).
+
 ## Collecting paper results
 
 `collect_results.py` snapshots everything needed for a paper into one folder (default

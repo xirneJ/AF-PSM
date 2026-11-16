@@ -57,6 +57,15 @@ if __name__ == '__main__':
     parser.add_argument('--alpha_mode', type=str, default=None,
                         choices=['predicted', 'random'],
                         help="AF-PSM v2: 'predicted' (v1 curriculum) or 'random'")
+    parser.add_argument('--cfg_scale', type=str, default=None,
+                        help="training guidance override: a float or 'lo,hi'. "
+                             "Narrowing the range (e.g. 1,3) reduces the "
+                             "self-distillation drift when long training collapses "
+                             "within-class diversity.")
+    parser.add_argument('--cfg_scale_ratio', type=float, default=None,
+                        help='fraction of the batch trained with guided targets')
+    parser.add_argument('--cfg_ratio', type=float, default=None,
+                        help='label-dropout probability used by CFG distillation')
     parser.add_argument('--warmup_steps', type=int, default=None,
                         help='override scheduler warmup (match schedules across models)')
     parser.add_argument('--no_cfg', action='store_true',
@@ -110,6 +119,13 @@ if __name__ == '__main__':
         cfg['meanflow']['cons_weight'] = args.cons_weight
     if args.alpha_mode is not None:
         cfg['meanflow']['alpha_mode'] = args.alpha_mode
+    if args.cfg_scale is not None:
+        parts = [float(s) for s in str(args.cfg_scale).split(',')]
+        cfg['meanflow']['cfg_scale'] = parts[0] if len(parts) == 1 else parts
+    if args.cfg_scale_ratio is not None:
+        cfg['meanflow']['cfg_scale_ratio'] = args.cfg_scale_ratio
+    if args.cfg_ratio is not None:
+        cfg['meanflow']['cfg_ratio'] = args.cfg_ratio
     if args.warmup_steps is not None:
         if cfg.get('scheduler') is None:
             cfg['scheduler'] = {}
