@@ -308,6 +308,47 @@ def main():
           f"cons={stats_real2['cons'].item():.4f} | "
           f"alpha_mode={afpsm_real2.alpha_mode} | cfg_scale={afpsm_real2.cfg_w_range}")
 
+    # ---------------- 13) v3 teacher distillation --------------------------
+    # A frozen multi-step teacher (uv / iMF parametrisation) provides the target.
+    # The student must receive gradients, the teacher must stay bit-identical.
+    teacher = build_model(C, H, mode='uv').eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    teacher_sd = {k: v.clone() for k, v in teacher.state_dict().items()}
+    afpsm_v3 = AFPSM(
+        channels=C, image_size=H, num_classes=10,
+        normalizer=['minmax', None, None],
+        time_dist=['mixed', -0.4, 1.0, 0.5],
+        alpha_mode='random', split_min=0.1,
+        pixel_weight=1.0, anchor_weight=1.0, cons_weight=0.5,
+        cfg_scale=None, teacher_steps=2, teacher_w=1.0, endpoint_prob=0.25,
+    )
+    afpsm_v3.attach_teacher(teacher, output_mode='uv', mode='i-meanflow')
+    model_v3 = build_model(C, H)
+    model_v3.train()
+    total_v3, stats_v3 = afpsm_v3.loss(model_v3, x, c, step=0, total_steps=1000)
+    assert torch.isfinite(total_v3), total_v3
+    for k in ('pixel', 'anchor', 'cons'):
+        assert k in stats_v3 and torch.isfinite(stats_v3[k]), k
+    assert stats_v3['pixel'].item() > 0 and stats_v3['anchor'].item() > 0
+    total_v3.backward()
+    no_grad_v3 = [n for n, p in model_v3.named_parameters()
+                  if p.requires_grad and p.grad is None and not n.startswith('alpha_')]
+    assert not no_grad_v3, no_grad_v3[:5]
+    for k, v in teacher_sd.items():
+        assert torch.equal(teacher.state_dict()[k], v), f'teacher changed: {k}'
+    assert all(p.grad is None for p in teacher.parameters())
+    # the 1-NFE endpoint path (t=1 -> r=0) is exercised directly
+    tgt = afpsm_v3._teacher_clean(torch.randn(B, C, H, H),
+                                  torch.ones(B), torch.zeros(B), c=c)
+    assert tgt.shape == (B, C, H, H) and torch.isfinite(tgt).all()
+    # a distilled student samples with w = 1 (the teacher carried the guidance)
+    assert abs(afpsm_v3._sampling_w(2, device)[0].item() - 1.0) < 1e-6
+    print(f"[13] v3 teacher distillation ok | total {total_v3.item():.4f} | "
+          f"pixel={stats_v3['pixel'].item():.4f} "
+          f"anchor={stats_v3['anchor'].item():.4f} "
+          f"cons={stats_v3['cons'].item():.4f} | teacher frozen | endpoint ok")
+
     print("\nALL SMOKE TESTS PASSED")
 
 

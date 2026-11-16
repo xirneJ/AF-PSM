@@ -302,6 +302,17 @@ class AFPSM:
         cfg_scale=None,
         cfg_scale_ratio=0.75,
         sample_w=None,
+        # ------------------------------------------------------------------
+        # v3: progressive distillation from a frozen multi-step teacher.
+        # When train.py attaches a teacher (--teacher_ckpt), the loss target
+        # becomes the teacher's K-step rollout at (t, r) instead of the
+        # self-referential CFG target.  The 1-step student then learns a real
+        # sample (not the class conditional mean), which is what makes 1-NFE
+        # work on natural images.
+        # ------------------------------------------------------------------
+        teacher_steps=2,
+        teacher_w=1.0,
+        endpoint_prob=0.0,
     ):
         self.channels = channels
         self.image_size = image_size
@@ -359,6 +370,16 @@ class AFPSM:
         # explicit sampling-time guidance scale (None -> midpoint of cfg_scale,
         # mirroring MeanFlow.sample_each_class)
         self.sample_w_value = None if sample_w is None else float(sample_w)
+
+        # ---- v3: frozen teacher (attached by train.py via attach_teacher) ----
+        self.teacher_steps = int(teacher_steps)
+        self.teacher_w = float(teacher_w)
+        # fraction of each batch forced onto the inference endpoint (t=1, r=0);
+        # a 1-NFE student is only as good as its coverage of that point
+        self.endpoint_prob = float(endpoint_prob)
+        self.teacher = None
+        self.teacher_output_mode = None
+        self.teacher_mode = None
 
     # ------------------------------------------------------------------ utils
     def sample_t_r(self, batch_size, device):
@@ -469,6 +490,65 @@ class AFPSM:
         den = (w * A.abs().pow(2)).mean().detach().clamp_min(1e-8)
         return num / den
 
+    # ------------------------------------------------------- teacher (v3)
+    def attach_teacher(self, model, output_mode='uv', mode='i-meanflow'):
+        """Attach a frozen multi-step teacher used as the distillation target.
+
+        The teacher is *not* part of the student's optimizer: it is put in eval
+        mode and every parameter is frozen.  ``output_mode`` selects how the
+        teacher's own sampler is driven:
+            'x'  -> closed-form DDIM state update (an AF-PSM style teacher)
+            'uv' -> velocity update z_r = z_t - (t - r) * u (an iMF teacher)
+        """
+        device = next(model.parameters()).device
+        model = model.to(device).eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self.teacher = model
+        self.teacher_output_mode = output_mode
+        self.teacher_mode = mode
+        return model
+
+    @torch.no_grad()
+    def _teacher_clean(self, z_t, t, r, c=None):
+        """Roll the frozen teacher K steps from (z_t, t) to r, return clean x.
+
+        Both parametrisations are supported:
+          * output_mode == 'x' : the teacher predicts the clean image directly;
+            the state is reconstructed with the closed-form DDIM update.
+          * output_mode == 'uv': the teacher predicts (u, v).  For the linear
+            interpolant v is constant along the path, so the final state can be
+            converted back to a clean image with  x = z_r - r * u.
+        The result is detached: it is a target, not a differentiable path.
+        """
+        teacher = self.teacher
+        assert teacher is not None, 'no teacher attached (call attach_teacher)'
+        K = max(int(self.teacher_steps), 1)
+        device = z_t.device
+        w = torch.full((z_t.shape[0],), self.teacher_w, device=device)
+        r4 = rearrange(r, "b -> b 1 1 1")
+
+        z, tt = z_t, t
+        last_clean, u_last = None, None
+        for k in range(K):
+            t_next = r + (t - r) * (K - 1 - k) / K
+            t4 = rearrange(tt, "b -> b 1 1 1")
+            n4 = rearrange(t_next, "b -> b 1 1 1")
+            if self.teacher_output_mode == 'x':
+                x_hat = teacher(z, tt, t_next, y=c, w=w, return_alpha=False,
+                                use_flash_attention=False)
+                last_clean = x_hat
+                z = ((1 - n4 / t4.clamp_min(1e-6)) * x_hat
+                     + (n4 / t4.clamp_min(1e-6)) * z)
+            else:
+                u, v = teacher(z, tt, t_next, y=c, w=w, return_v=True,
+                               use_flash_attention=False)
+                u_last = u
+                z = z - (t4 - n4) * u
+                last_clean = z - r4 * u          # x = z_r - r * u (u == v here)
+            tt = t_next
+        return last_clean.detach()
+
     # ------------------------------------------------------------------- loss
     def loss(self, model, x, c=None, step=0, total_steps=None):
         """
@@ -493,6 +573,13 @@ class AFPSM:
         batch_size, device = x.shape[0], x.device
 
         t, r = self.sample_t_r(batch_size, device)
+        # v3: force part of the batch onto the 1-NFE inference endpoint (t=1, r=0).
+        # The logit-normal / uniform mixture only visits it with small probability,
+        # but a 1-step student is judged exactly there.
+        if self.endpoint_prob > 0:
+            ep = torch.rand(batch_size, device=device) < self.endpoint_prob
+            t = torch.where(ep, torch.ones_like(t), t)
+            r = torch.where(ep, torch.zeros_like(r), r)
         t4 = rearrange(t, "b -> b 1 1 1").detach().clone()
         r4 = rearrange(r, "b -> b 1 1 1").detach().clone()
 
@@ -505,7 +592,14 @@ class AFPSM:
         # Mirrors the iMF baseline: w is a model input and the guided target is
         # built from no-grad conditional / unconditional predictions, so sampling
         # stays at a single forward pass (no doubled NFE).
-        if c is not None and self.use_cfg_w:
+        if self.teacher is not None:
+            # ---- v3: the frozen multi-step teacher provides the target --------
+            # No self-referential CFG target: the target is a teacher rollout, so
+            # the student learns to reproduce a real sample instead of the class
+            # conditional mean (which is what killed 1-NFE on CIFAR in v2).
+            c_cond, w_cond = c, None
+            target = self._teacher_clean(z_t, t, r, c=c)
+        elif c is not None and self.use_cfg_w:
             uncond = torch.full_like(c, self.num_classes)
             w = self._sample_w_batch(batch_size, device)
             drop = torch.rand(batch_size, device=device) < self.cfg_ratio

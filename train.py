@@ -66,6 +66,19 @@ if __name__ == '__main__':
                         help='fraction of the batch trained with guided targets')
     parser.add_argument('--cfg_ratio', type=float, default=None,
                         help='label-dropout probability used by CFG distillation')
+    parser.add_argument('--endpoint_prob', type=float, default=None,
+                        help='fraction of each batch forced to the 1-NFE endpoint '
+                             '(t=1, r=0); used when distilling a 1-step student')
+    parser.add_argument('--teacher_ckpt', type=str, default=None,
+                        help='frozen multi-step teacher checkpoint to distil from '
+                             '(AF-PSM only; the loss target becomes the teacher rollout)')
+    parser.add_argument('--teacher_config', type=str, default=None,
+                        help='config file that defines the teacher architecture '
+                             '(required with --teacher_ckpt)')
+    parser.add_argument('--teacher_steps', type=int, default=2,
+                        help='teacher rollout steps used to build the target')
+    parser.add_argument('--teacher_w', type=float, default=1.0,
+                        help='guidance scale used for the teacher rollout')
     parser.add_argument('--warmup_steps', type=int, default=None,
                         help='override scheduler warmup (match schedules across models)')
     parser.add_argument('--no_cfg', action='store_true',
@@ -126,6 +139,8 @@ if __name__ == '__main__':
         cfg['meanflow']['cfg_scale_ratio'] = args.cfg_scale_ratio
     if args.cfg_ratio is not None:
         cfg['meanflow']['cfg_ratio'] = args.cfg_ratio
+    if args.endpoint_prob is not None:
+        cfg['meanflow']['endpoint_prob'] = args.endpoint_prob
     if args.warmup_steps is not None:
         if cfg.get('scheduler') is None:
             cfg['scheduler'] = {}
@@ -156,6 +171,8 @@ if __name__ == '__main__':
               f"{cfg['meanflow'].get('anchor_weight', 1.0)}/"
               f"{cfg['meanflow'].get('cons_weight', 0.0)} "
               f"cfg_scale={cfg['meanflow'].get('cfg_scale')} "
+              f"endpoint_prob={cfg['meanflow'].get('endpoint_prob', 0.0)} "
+              f"teacher={os.path.basename(args.teacher_ckpt) if args.teacher_ckpt else None} "
               f"warmup={cfg.get('scheduler', {}).get('warmup_steps', 0)} "
               f"precision={cfg.get('mixed_precision', 'bf16')}")
         print(f"[data] dataset={cfg['dataset']} root={resolve_data_root(cfg)}")
@@ -232,6 +249,34 @@ if __name__ == '__main__':
     else:
         meanflow = MeanFlow(mode=mf_mode, **mf_cfg)
 
+    # ---- v3: optional frozen teacher for progressive distillation ------------
+    teacher_model = None
+    teacher_mode = None
+    if args.teacher_ckpt is not None:
+        if not is_afpsm:
+            raise SystemExit('--teacher_ckpt only applies to AF-PSM (mode=af-psm)')
+        if not args.teacher_config:
+            raise SystemExit('--teacher_ckpt requires --teacher_config')
+        tspec = importlib.util.spec_from_file_location(
+            'teacher_config', args.teacher_config)
+        tmodule = importlib.util.module_from_spec(tspec)
+        tspec.loader.exec_module(tmodule)
+        tcfg = tmodule.config
+        t_mf = dict(tcfg['meanflow'])
+        teacher_mode = t_mf.pop('mode', 'i-meanflow')
+        teacher_model = MFDiT(**tcfg['model']).to(accelerator.device)
+        t_state = torch.load(args.teacher_ckpt, map_location=accelerator.device)
+        if isinstance(t_state, dict) and 'model' in t_state:
+            t_state = t_state['model']          # tolerate wrapped checkpoints
+        teacher_model.load_state_dict(t_state)
+        meanflow.teacher_steps = args.teacher_steps
+        meanflow.teacher_w = args.teacher_w
+        meanflow.attach_teacher(
+            teacher_model,
+            output_mode=tcfg['model'].get('output_mode', 'uv'),
+            mode=teacher_mode,
+        )
+
     if vae is not None:
         model, vae, optimizer, train_dataloader = accelerator.prepare(
             model, vae, optimizer, train_dataloader
@@ -269,9 +314,18 @@ if __name__ == '__main__':
         n_params = sum(p.numel() for p in model_module.parameters())
         print(f"MF mode: {mf_mode}")
         print(f"Model size: {n_params / 1e6:.2f}M")
+        if teacher_model is not None:
+            print(f"[teacher] {args.teacher_ckpt} mode={teacher_mode} "
+                  f"output_mode={meanflow.teacher_output_mode} "
+                  f"steps={meanflow.teacher_steps} w={meanflow.teacher_w} (frozen)")
         with open(cfg['log_file'], 'a') as f:
             f.write(f"MF mode: {mf_mode}\n")
-            f.write(f"Model size: {n_params / 1e6:.2f}M\n\n")
+            f.write(f"Model size: {n_params / 1e6:.2f}M\n")
+            if teacher_model is not None:
+                f.write(f"[teacher] {args.teacher_ckpt} mode={teacher_mode} "
+                        f"steps={meanflow.teacher_steps} "
+                        f"w={meanflow.teacher_w} (frozen)\n")
+            f.write("\n")
 
     global_step = resume_step
     grad_clip = cfg['grad_clip']

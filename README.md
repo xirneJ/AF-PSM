@@ -104,6 +104,35 @@ Mitigation: narrow the training guidance range, e.g. `--cfg_scale 1,3` (amplific
 this is what long `afpsm_*_v2.py` runs should use. Related knobs: `--cfg_scale_ratio` (fraction of
 the batch trained with guided targets) and `--cfg_ratio` (label dropout probability).
 
+### Progressive distillation from a frozen multi-step teacher (v3)
+
+The 1-NFE student can also be *distilled* instead of trained from scratch. With a
+frozen teacher attached, the loss target becomes the teacher's K-step rollout at
+`(t, r)` — no self-referential CFG target, so the 1-step output is a real sample
+instead of a sharpened class conditional mean (which is what limits 1-NFE on
+natural images):
+
+```bash
+python train.py --config configs/afpsm_mnist_v2.py --n_steps 10000 --batch_size 32 \
+  --flash 1 --ckpt 1 --ckpt_every 2000 --no_cfg \
+  --pixel_weight 1.0 --anchor_weight 1.0 --cons_weight 0.5 --endpoint_prob 0.25 \
+  --teacher_ckpt logs/mnist_imf60k_cfg/ckpts/step_0060000.pt \
+  --teacher_config configs/mnist.py --teacher_steps 2 --teacher_w 1.0 \
+  --run_suffix v3distill_mnist10k
+```
+
+- `--teacher_ckpt` / `--teacher_config`: frozen teacher checkpoint + architecture
+  config.  Both parametrisations are supported — an iMF teacher (`output_mode='uv'`)
+  is driven with the velocity update, an AF-PSM teacher (`'x'`) with the
+  closed-form DDIM update.
+- `--teacher_steps`: K used to build the target (bigger = better target, slower).
+- `--endpoint_prob`: fraction of each batch forced onto the inference endpoint
+  `(t=1, r=0)`; without it the endpoint is rarely visited and 1-step output is
+  under-trained.
+- the student runs with `--no_cfg` (the teacher already carried the guidance), so
+  sampling uses `w = 1` and costs exactly 1 NFE.  Evaluate it with
+  `fid_eval.py --no_cfg`.
+
 ## Collecting paper results
 
 `collect_results.py` snapshots everything needed for a paper into one folder (default
